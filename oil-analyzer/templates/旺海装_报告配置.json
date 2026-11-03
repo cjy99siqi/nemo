@@ -1,0 +1,17 @@
+{
+  "project": "京能岱海旺海装风电场",
+  "data_dir": "C:\\Users\\17617\\Desktop\\京能岱海旺海装风电场",
+  "template": "templates/营盘梁_月度报告模板.docx",
+  "style": "营盘梁（鑫世达）",
+  "unit_type": "风力发电机组",
+  "unit_count": 75,
+  "sections": [
+    "磨损",
+    "磨损浓度趋势图",
+    "清洁度",
+    "水分",
+    "粘度"
+  ],
+  "history": "templates/旺海装_历史浓度.xlsx",
+  "missing_unit_text": "本月无数据存储。"
+}

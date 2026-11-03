@@ -1,0 +1,16 @@
+# 运行产物
+reports/
+zip_cache/
+__pycache__/
+*.pyc
+*.db
+*.log
+
+# 临时/预览
+.dsh-*/
+tools/
+*.docx.tmp
+
+# 系统
+Thumbs.db
+desktop.ini

@@ -1,0 +1,7 @@
+numpy
+pandas
+scipy
+matplotlib
+tkcalendar
+openpyxl
+xlrd>=2.0

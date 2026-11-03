@@ -1,0 +1,11 @@
+{
+  "project": "营盘梁",
+  "data_dir": "C:\\Users\\17617\\Desktop\\岱海一标营盘梁风电场",
+  "template": "templates/营盘梁_月度报告模板.docx",
+  "style": "鑫世达",
+  "unit_type": "风力发电机组",
+  "unit_count": 75,
+  "sections": ["磨损", "磨损浓度趋势图", "清洁度", "水分", "粘度"],
+  "history": "templates/营盘梁_历史浓度.xlsx",
+  "missing_unit_text": "本月无数据存储。"
+}
