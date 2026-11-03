@@ -219,6 +219,16 @@ def _variants(header):
     return res
 
 
+# 磨粒浓度判定阈值（mg/kg，现场报告口径）——**唯一来源**：
+#   报告表格 _judge_max、磨损结论 wear_verdict、界面参数 wear_ferrous / wear_nonferrous
+#   三处都从这里取值，改阈值只需改这里。
+#   铁磁 0-20 正常 / 20-25 预警 / >25 报警
+#   非铁磁 0-15 正常 / 15-20 预警 / >20 报警
+REPORT_LIMITS = {
+    "ferrous": (20.0, 25.0),
+    "nonferrous": (15.0, 20.0),
+}
+
 _WEAR = [
     ("Fe", "铁", 120), ("Cu", "铜", 30), ("Al", "铝", 25), ("Cr", "铬", 10),
     ("Pb", "铅", 15), ("Sn", "锡", 12), ("Si", "硅", 25), ("Na", "钠", 20),
@@ -236,6 +246,15 @@ for _sym, _cn, _lim in _WEAR:
         round(_lim * 0.7, 2) if _lim else None,
         float(_lim) if _lim else None,
     )
+
+# 磨粒浓度：阈值取自 REPORT_LIMITS（与报告表格/结论同源）。
+# 磨损分析流程算出的 b7/g7 就是这两个量；CSV 里若出现对应列也能直接解析判定。
+_add_param("wear_ferrous", "铁磁磨粒", "wear", "mg/kg",
+           ("铁磁磨粒", "铁磁性磨粒", "磨粒(铁磁)", "铁磁浓度", "b7", "b7浓度"),
+           "max", REPORT_LIMITS["ferrous"][0], REPORT_LIMITS["ferrous"][1])
+_add_param("wear_nonferrous", "非铁磁磨粒", "wear", "mg/kg",
+           ("非铁磁磨粒", "非磁性磨粒", "磨粒(非铁磁)", "非铁磁浓度", "g7", "g7浓度"),
+           "max", REPORT_LIMITS["nonferrous"][0], REPORT_LIMITS["nonferrous"][1])
 
 _add_param("clean_nas", "清洁度 NAS", "clean", "级",
            ("nas", "nas等级", "nas1638", "清洁度nas", "清洁度等级"), "max", 10, 11)
@@ -1628,15 +1647,11 @@ def load_wear_csv(path):
 
 
 def _wear_time(value):
-    s = str(value or "").strip()
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f",
-                "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M:%S.%f",
-                "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(s, fmt)
-        except ValueError:
-            continue
-    return None
+    """磨损时序的时间解析。统一走 parse_datetime_text。
+
+    历史实现是另一份副本，且少认 "%Y/%m/%d"，同一份数据两条链路口径不一致。
+    """
+    return parse_datetime_text(value)
 
 
 def wear_verdict(b7, g7):
@@ -1692,8 +1707,11 @@ def analyze_wear(rows):
     # 采样天数：该机组实际首末采集日（含首尾，如 8/12–8/31 为 20 天）
     if t0 and t1:
         days = (t1.date() - t0.date()).days + 1
+        days_estimated = False
     else:
+        # 时间一列全解析失败时的兜底；days_estimated=True 标记"浓度口径按默认 28 天估算"
         days = WEAR_PERIOD_DAYS
+        days_estimated = True
 
     per_day = [int(s / days) for s in sums]
     per_l = [pd / (WEAR_FLOW_LPM * 60 * 24) for pd in per_day]
@@ -1753,6 +1771,7 @@ def analyze_wear(rows):
         "b7": b7,
         "g7": g7,
         "days": days,
+        "days_estimated": days_estimated,
         "ym": ym,
         "ym_trend": ym_trend,
         "conclusion": conclusion,
@@ -1902,15 +1921,10 @@ REPORT_AUTHOR = "曹居易"
 REPORT_REVIEWER = "王振尧"
 
 # 报告判定阈值（按现场报告口径）：
-#   铁磁 0-20 正常 / 20-25 预警 / >25 报警
-#   非铁磁 0-15 正常 / 15-20 预警 / >20 报警
+#   磨粒（铁磁/非铁磁）的阈值已上移到参数注册之前，见 REPORT_LIMITS
 #   NAS <9 正常 / =9 预警 / >=10 报警
 #   AW 0-80 正常 / 80-90 预警 / >90 报警
 #   VT40 以 320 为基准：272~368 正常 / ≤272 或 ≥368 预警 / ≤256 或 ≥384 报警
-REPORT_LIMITS = {
-    "ferrous": (20.0, 25.0),
-    "nonferrous": (15.0, 20.0),
-}
 NAS_LIMITS = (9.0, 11.0)
 AW_LIMITS = (80.0, 90.0)
 VT40_NOMINAL = 320.0
@@ -3582,8 +3596,27 @@ ANALYSIS_TABS = [
 ]
 
 
+# 时间文本解析：统计无法解析的条数，扫描结束时在状态栏提示，避免"静默丢行"。
+PARSE_STATS = {"unparsed": 0}
+
+_TS_RE = re.compile(
+    r"^(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})\s*日?"
+    r"(?:[ T]\s*(\d{1,2})\s*[:：]\s*(\d{1,2})"
+    r"(?:\s*[:：]\s*(\d{1,2})(?:\.(\d{1,6}))?)?)?$"
+)
+
+
 def parse_datetime_text(value):
+    """解析时间文本，容忍不补零/中文分隔的写法（如 2026/9/5 8:05、2026年9月5日）。
+
+    历史实现只认零填充的固定格式，现场导出的 `2026/9/5 8:05` 直接返回 None，
+    调用方按"时间无效"丢行且没有任何提示；丢光后 days 还会回落到 28 天，
+    浓度口径随之变化。现在：常见格式走 strptime 快路径，其余用正则拆字段。
+    解析失败累加 PARSE_STATS["unparsed"]。
+    """
     s = str(value or "").strip()
+    if not s:
+        return None
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f",
                 "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M:%S.%f",
                 "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d"):
@@ -3591,6 +3624,16 @@ def parse_datetime_text(value):
             return datetime.strptime(s, fmt)
         except ValueError:
             continue
+    m = _TS_RE.match(s)
+    if m:
+        y, mo, d, hh, mi, ss, frac = m.groups()
+        try:
+            return datetime(int(y), int(mo), int(d),
+                            int(hh or 0), int(mi or 0), int(ss or 0),
+                            int((frac or "0").ljust(6, "0")[:6]))
+        except ValueError:
+            pass
+    PARSE_STATS["unparsed"] += 1
     return None
 
 
@@ -4759,6 +4802,7 @@ class OilGUI:
             return
         self.scanning = True
         self.progress["value"] = 0
+        PARSE_STATS["unparsed"] = 0          # 每次扫描重新统计时间解析失败数
         self.status_label.config(text="准备扫描…")
         for b in (self.btn_dir, self.btn_rescan, self.btn_clear, self.btn_analysis):
             b.state(["disabled"])
@@ -4791,6 +4835,8 @@ class OilGUI:
                             % (stats["parsed"], stats["skipped"], stats["failed"], stats["records"]))
                     if stats.get("kept_projects"):
                         line += "；保留其他 %d 个项目" % stats["kept_projects"]
+                    if PARSE_STATS.get("unparsed"):
+                        line += "；%d 处时间文本无法解析（相关行已跳过）" % PARSE_STATS["unparsed"]
                     self.status_label.config(text=line)
                     for b in (self.btn_dir, self.btn_rescan, self.btn_clear, self.btn_analysis):
                         b.state(["!disabled"])
