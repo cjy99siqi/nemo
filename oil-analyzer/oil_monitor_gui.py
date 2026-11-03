@@ -2616,6 +2616,56 @@ def _load_history_xlsx(name):
     return data
 
 
+def load_report_config(project, config_dir=None):
+    """按项目名匹配 templates/*_报告配置.json，返回配置 dict；无匹配返回 None。
+
+    匹配顺序：① 配置里的 project 字段与实际项目名互相包含；② 文件名前缀
+    （如 营盘梁_报告配置.json → 营盘梁）出现在项目名里。
+    读取用 utf-8-sig，容忍记事本另存产生的 BOM；坏文件跳过不抛异常。
+    """
+    config_dir = config_dir or os.path.join(APP_DIR, "templates")
+    if not os.path.isdir(config_dir):
+        return None
+    proj = str(project or "")
+    for name in sorted(os.listdir(config_dir)):
+        if not name.lower().endswith(".json") or "报告配置" not in name:
+            continue
+        path = os.path.join(config_dir, name)
+        try:
+            with open(path, encoding="utf-8-sig") as fp:
+                cfg = json.load(fp)
+        except Exception:
+            continue
+        if not isinstance(cfg, dict):
+            continue
+        cfg_proj = str(cfg.get("project") or "")
+        stem = name.split("_报告配置")[0]
+        if (cfg_proj and (cfg_proj in proj or proj in cfg_proj)) or (stem and stem in proj):
+            cfg["_path"] = path
+            return cfg
+    return None
+
+
+def report_unit_count(project, config_dir=None):
+    """报告要覆盖的机组台数：优先读配置 unit_count，否则沿用历史硬编码规则。
+
+    返回 (台数, 配置dict或None)。0 表示不补齐空机组。
+    """
+    cfg = load_report_config(project, config_dir)
+    if cfg is not None:
+        raw = cfg.get("unit_count")
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
+            return n, cfg
+    proj = str(project or "")
+    if "营盘梁" in proj or "岱海" in proj:
+        return 75, cfg          # 历史规则，无配置文件时的兜底
+    return 0, cfg
+
+
 def build_analysis_report_docx(project, store, out_dir, start=None, end=None):
     """按项目生成油品分析报告（Word），可限定统计时间段。"""
     from docx import Document
@@ -2635,8 +2685,9 @@ def build_analysis_report_docx(project, store, out_dir, start=None, end=None):
         "clean": any(e["nas_vals"] for e in entries),
         "vis": any(e["vt_vals"] for e in entries),
     }
-    # 营盘梁项目按 75 台机组出报告，缺数据的机组补空记录
-    _declared = 75 if ("营盘梁" in project or "岱海" in project) else 0
+    # 报告覆盖的机组台数：templates/<项目>_报告配置.json 的 unit_count 优先，
+    # 没有配置则沿用历史规则（营盘梁/岱海 = 75 台）。缺数据的机组补空记录。
+    _declared = report_unit_count(project)[0]
     if _declared:
         _have = {e["unit"] for e in entries}
         for _i in range(1, _declared + 1):
