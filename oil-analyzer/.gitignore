@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 *.db
 *.log
+gui_state.json
 
 # 临时/预览
 .dsh-*/
