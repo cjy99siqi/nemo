@@ -21,9 +21,9 @@ python tests\test_report_config.py   # 报告配置/台数逻辑
 2. **不要用 UTF-8 重存 `.bat`**：cmd 按 936 代码页解析，重存会导致启动失败（本项目 bat 带 `chcp 65001`，改动需实测）。
 3. **报告台数**走 `templates/<项目>_报告配置.json` 的 `unit_count`，无配置才回落到历史规则（营盘梁/岱海=75）。改台数不要改代码。
 4. **改计算口径必须同步改版本号**：`PARSE_VERSION` 变化会触发全量重解析；`DB_SCHEMA_VERSION` 只管表结构。
-5. **两套限值并存**：界面用 `PARAMS`（ppm/级），Word 报告用 `REPORT_LIMITS`（mg/kg）。改限值必须两处一起改，否则会出现"界面正常、报告预警"。
+5. **限值分两类，别混**：`PARAMS`（:232 起）是元素/理化指标（Fe 是 ppm，限值 84/120）；`REPORT_LIMITS`（:1907）是磨粒浓度 mg/kg（铁磁 20/25、非铁磁 15/20）。磨粒判定统一走 `wear_verdict()`，`analyze_wear` 里不再写字面量——改阈值只改 `REPORT_LIMITS` 一处。
 6. 运行产物（`oil_cache.db`、`gui_state.json`、`reports/`）不进仓库。
-7. 提交前跑一遍 `python tests\test_report_config.py`。
+7. 提交前跑 `python tests\test_report_config.py` 与 `python tests\test_wear_limits.py`。
 
 ## 改代码时优先看
 `项目说明.md §3 代码结构地图`（GUI 三大区、解析、缓存、报告链路）与 `§6 已知坑`（时间段过滤静默丢行、Excel 合并单元格锚点、公式不算值等）。

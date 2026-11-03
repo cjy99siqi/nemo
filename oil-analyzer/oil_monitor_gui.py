@@ -1639,6 +1639,26 @@ def _wear_time(value):
     return None
 
 
+def wear_verdict(b7, g7):
+    """磨粒浓度分级：阈值只来自 REPORT_LIMITS，与报告表格判定同源。
+
+    返回 'none' | 'low' | 'alarm' | 'warn' | 'other'。判定顺序与历史逻辑一致：
+    先看"基本没有产生"（<1），再看"低速率"（低于两条预警线），然后报警、预警，
+    其余（含恰好等于预警线的情形）归 'other' → 报告里显示"数据待复核"。
+    """
+    f_warn, f_alarm = REPORT_LIMITS["ferrous"]
+    n_warn, n_alarm = REPORT_LIMITS["nonferrous"]
+    if b7 < 1 and g7 < 1:
+        return "none"
+    if (b7 > 1 or g7 > 1) and (b7 < f_warn and g7 < n_warn):
+        return "low"
+    if b7 > f_alarm or g7 > n_alarm:
+        return "alarm"
+    if b7 > f_warn or g7 > n_warn:
+        return "warn"
+    return "other"
+
+
 def analyze_wear(rows):
     """rows: load_wear_csv 的结果（首行表头）。返回统计与结论。"""
     if len(rows) < 3:
@@ -1703,23 +1723,25 @@ def analyze_wear(rows):
     elif same_start_end and not all_zero:
         conclusion = "%s磨损数据异常保持不变，建议检查采集设备和传感器运行状态。" % ym.replace("份", "")
         color = "AACC99"
-    elif b7 < 1 and g7 < 1:
-        conclusion = "%s磨损基本没有产生，单位体积油液颗粒含量和颗粒浓度均很小，设备运行正常。" % ym
-        color = "AACC99"
-    elif (b7 > 1 or g7 > 1) and (b7 < 20 and g7 < 15):
-        conclusion = "%s小的磨损数据持续小速率产生，机组正常。" % ym
-        color = "AACC99"
-    elif b7 > 25 or g7 > 20:
-        conclusion = ("%s机组磨粒产生浓度较高，达到报警限度，建议 2 周内检查确认，"
-                      "并结合振动分析判断设备运行状态。" % ym)
-        color = "FFC7CE"
-    elif b7 > 20 or g7 > 15:
-        conclusion = ("%s机组磨粒产生浓度较高，达到预警限度，建议 2 个月内检查确认，"
-                      "并结合振动分析判断设备运行状态。" % ym)
-        color = "FFFF99"
     else:
-        conclusion = "%s数据待复核" % ym
-        color = "AACC99"
+        _v = wear_verdict(b7, g7)          # 阈值来源 REPORT_LIMITS，勿在此处再写字面量
+        if _v == "none":
+            conclusion = "%s磨损基本没有产生，单位体积油液颗粒含量和颗粒浓度均很小，设备运行正常。" % ym
+            color = "AACC99"
+        elif _v == "low":
+            conclusion = "%s小的磨损数据持续小速率产生，机组正常。" % ym
+            color = "AACC99"
+        elif _v == "alarm":
+            conclusion = ("%s机组磨粒产生浓度较高，达到报警限度，建议 2 周内检查确认，"
+                          "并结合振动分析判断设备运行状态。" % ym)
+            color = "FFC7CE"
+        elif _v == "warn":
+            conclusion = ("%s机组磨粒产生浓度较高，达到预警限度，建议 2 个月内检查确认，"
+                          "并结合振动分析判断设备运行状态。" % ym)
+            color = "FFFF99"
+        else:
+            conclusion = "%s数据待复核" % ym
+            color = "AACC99"
 
     return {
         "rows": rows,
