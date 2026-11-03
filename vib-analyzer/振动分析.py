@@ -2636,6 +2636,15 @@ class SpectrumWindow(tk.Toplevel):
             v = tk.BooleanVar(value=(k in ("BPFI", "BPFO")))
             ttk.Checkbutton(box, text=k, variable=v).grid(row=0, column=i, padx=6)
             keys[k] = v
+        # 自定义倍数：库里没有的轴承（或临时改倍数）可直接填特征倍数。
+        # 留空 = 用 BEARING_LIB 的库值；填了 = 按所选轴承的轴转频覆盖对应项。
+        ttk.Label(frm, text="自定义倍数(可留空)：").grid(row=5, column=0, sticky="e", pady=3)
+        cbox = ttk.Frame(frm); cbox.grid(row=5, column=1, sticky="w", pady=3)
+        v_cust = {}
+        for _i, _k in enumerate(("BPFI", "BPFO", "BSF", "FTF")):
+            ttk.Label(cbox, text=_k).grid(row=0, column=_i * 2, padx=(0 if _i == 0 else 6, 1))
+            v_cust[_k] = tk.StringVar(value="")
+            ttk.Entry(cbox, textvariable=v_cust[_k], width=6).grid(row=0, column=_i * 2 + 1)
         res = {"ok": False}
 
         def ok():
@@ -2665,7 +2674,8 @@ class SpectrumWindow(tk.Toplevel):
                 if _val > 0:
                     _cust[_k] = _val
             if _cust:
-                mult = _cust
+                mult = dict(mult)          # 复制一份：mult 原为 BEARING_LIB 里的字典，直接改会污染全局表
+                mult.update(_cust)
             n_ord = int(v_ord.get() or 1)
             for k in sel:
                 m = mult.get(k)
@@ -2680,7 +2690,7 @@ class SpectrumWindow(tk.Toplevel):
             res["ok"] = True
             dlg.destroy()
 
-        bf = ttk.Frame(frm); bf.grid(row=5, column=0, columnspan=2, pady=(10, 0), sticky="e")
+        bf = ttk.Frame(frm); bf.grid(row=6, column=0, columnspan=2, pady=(10, 0), sticky="e")
         ttk.Button(bf, text="确定", command=ok).pack(side="left", padx=4)
         ttk.Button(bf, text="取消", command=dlg.destroy).pack(side="left", padx=4)
         dlg.bind("<Return>", lambda e: ok())
