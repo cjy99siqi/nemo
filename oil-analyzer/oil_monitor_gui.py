@@ -39,7 +39,8 @@ else:
 STATE_FILE = os.path.join(APP_DIR, "gui_state.json")
 DB_FILE = os.path.join(APP_DIR, "oil_cache.db")
 DB_SCHEMA_VERSION = 3
-PARSE_VERSION = 8          # 解析规则版本：升级后首次启动自动全量重解析，避免沿用旧缓存
+PARSE_VERSION = 9          # 解析规则版本：升级后首次启动自动全量重解析，避免沿用旧缓存
+                           # v9：磨损 CSV 额外产出 wear_ferrous/wear_nonferrous 记录（b7/g7 入库）
 
 # 宾泉项目历史磨损浓度（内嵌，随程序走，不依赖外部 Excel）
 BINQUAN_HISTORY = {
@@ -1579,6 +1580,9 @@ class Scanner:
                 stats["failed"] += 1
                 continue
             records, sheets, err = parse_workbook(e["real"], e["vpath"])
+            # 磨损 CSV 额外产出 b7/g7 两条记录，界面表格与报告使用同一数值
+            if not err and is_wear_csv(e["vpath"]):
+                records = records + wear_records(e["real"], e["vpath"])
             info = {"real_path": e["real"], "size": e["size"], "mtime": e["mtime"],
                     "status": "error" if err else "ok", "error": err, "sheets": sheets}
             self.store.replace_records(e["vpath"], e["project"], records, info)
@@ -1772,6 +1776,8 @@ def analyze_wear(rows):
         "g7": g7,
         "days": days,
         "days_estimated": days_estimated,
+        "t0": t0,
+        "t1": t1,
         "ym": ym,
         "ym_trend": ym_trend,
         "conclusion": conclusion,
@@ -1781,6 +1787,37 @@ def analyze_wear(rows):
         "zero": counter_zero,
         "constant": same_start_end and not counter_zero,
     }
+
+
+def wear_records(path, vpath):
+    """磨损 CSV → 两条 records（铁磁/非铁磁磨粒浓度），让界面表格也能看到磨粒判定。
+
+    与报告同源：数值来自 analyze_wear（b7/g7），状态来自 judge（阈值即 REPORT_LIMITS）。
+    这样「界面」和「报告」用的是同一批数值与同一套阈值，不会各算一套。
+    解析失败返回 []，不影响同目录其它文件的扫描。
+    """
+    try:
+        a = analyze_wear(load_wear_csv(path))
+    except Exception:
+        return []
+    t = a.get("t1") or a.get("t0")
+    if t is not None:
+        date = t.strftime("%Y-%m-%d")
+    else:
+        ym = str(a.get("ym_trend") or "")
+        date = ym.replace(".", "-") + "-01" if re.fullmatch(r"\d{4}\.\d{1,2}", ym) else ""
+    device = guess_device(vpath)
+    out = []
+    for param, value in (("wear_ferrous", a.get("b7")), ("wear_nonferrous", a.get("g7"))):
+        if value is None:
+            continue
+        v = round(float(value), 4)
+        out.append({
+            "device": device, "point": "磨损", "oil": "", "date": date,
+            "param": param, "value": v, "raw": "%.4f" % v,
+            "unit": PARAMS[param]["unit"], "status": judge(param, v), "sheet": "",
+        })
+    return out
 
 
 def _make_wear_chart(ws_data, col, start_row, last_row, title):

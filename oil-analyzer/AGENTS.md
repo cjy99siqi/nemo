@@ -17,6 +17,7 @@ python tests\test_report_config.py   # 报告配置/台数逻辑
 python tests\test_wear_limits.py     # 磨粒阈值口径
 python tests\test_params_limits.py   # 磨粒参数与 PARAMS 限值
 python tests\test_time_parse.py      # 时间解析（不补零/中文格式）
+python tests\test_wear_records.py    # 磨粒 b7/g7 入库
 ```
 
 ## 硬性约定
@@ -26,8 +27,9 @@ python tests\test_time_parse.py      # 时间解析（不补零/中文格式）
 4. **改计算口径必须同步改版本号**：`PARSE_VERSION` 变化会触发全量重解析；`DB_SCHEMA_VERSION` 只管表结构。
 5. **限值分两类，别混**：`PARAMS`（:232 起）是元素/理化指标（Fe 是 ppm，限值 84/120）；`REPORT_LIMITS`（:222，已上移到参数注册之前）是磨粒浓度 mg/kg（铁磁 20/25、非铁磁 15/20）。三处共用它：报告表格 `_judge_max`、磨损结论 `wear_verdict()`、界面参数 `wear_ferrous`/`wear_nonferrous`——改阈值只改 `REPORT_LIMITS` 一处。
 6. **时间解析统一走 `parse_datetime_text`**：`_wear_time` 只是它的别名，不要另写副本。解析失败计入 `PARSE_STATS["unparsed"]`（扫描结束显示在状态栏）；`analyze_wear` 的 `days_estimated=True` 表示用了 28 天兜底，浓度口径是估算值。
-7. 运行产物（`oil_cache.db`、`gui_state.json`、`reports/`）不进仓库。
-8. 提交前跑 `tests\` 下四个测试：`test_report_config.py`、`test_wear_limits.py`、`test_params_limits.py`、`test_time_parse.py`。
+7. **磨粒记录在扫描时入库**：`Scanner.run` 对磨损 CSV 追加 `wear_records()` 产出的 `wear_ferrous`/`wear_nonferrous` 两条记录，数值与报告同源。当前 `PARSE_VERSION = 9`——改动这条链路时要继续 +1，否则老库不会重算。
+8. 运行产物（`oil_cache.db`、`gui_state.json`、`reports/`）不进仓库。
+9. 提交前跑 `tests\` 下五个测试：`test_report_config.py`、`test_wear_limits.py`、`test_params_limits.py`、`test_time_parse.py`、`test_wear_records.py`。
 
 ## 改代码时优先看
 `项目说明.md §3 代码结构地图`（GUI 三大区、解析、缓存、报告链路）与 `§6 已知坑`（时间段过滤静默丢行、Excel 合并单元格锚点、公式不算值等）。
