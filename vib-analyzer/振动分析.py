@@ -111,6 +111,74 @@ _WF_LIB = {
 }
 BEARING_LIB.update(_WF_LIB)
 
+# 外部轴承库：数据\轴承库.json（可选）。存在则合并进 BEARING_LIB：
+#   同名轴承 → 用文件里的值覆盖；新名字 → 追加。
+# 结构：
+#   {"version": 1,
+#    "bearings": {"轴承名": {"shaft": "H|M|S|L|P", "BPFI": 4.813, "BPFO": 3.187,
+#                            "FTF": 0.400, "BSF": 2.360}}}
+# 目的：改倍数不必动源码；缺文件或字段非法时只记 warning，启动不受影响。
+BEARING_LIB_FILE = os.path.join(APP_DIR, "数据", "轴承库.json")
+BEARING_SHAFTS = ("H", "M", "S", "L", "P")
+BEARING_LIB_WARNINGS = []
+
+
+def load_bearing_lib(path=None):
+    """把 JSON 轴承库合并进 BEARING_LIB，返回 (新增数, 覆盖数, warnings)。
+
+    文件不存在视为“用内置库”，返回 (0, 0, []) 且不留 warning。
+    """
+    path = path or BEARING_LIB_FILE
+    warns = []
+    if not os.path.exists(path):
+        return 0, 0, warns
+    try:
+        # utf-8-sig：容忍记事本/PowerShell 另存时带的 BOM（纯 utf-8 也能读）
+        with open(path, encoding="utf-8-sig") as fp:
+            doc = json.load(fp)
+    except Exception as e:
+        warns.append("轴承库读取失败(%s): %s" % (os.path.basename(path), e))
+        BEARING_LIB_WARNINGS.extend(warns)
+        return 0, 0, warns
+    items = doc.get("bearings") if isinstance(doc, dict) else None
+    if not isinstance(items, dict):
+        warns.append("轴承库格式错误：缺少 bearings 对象")
+        BEARING_LIB_WARNINGS.extend(warns)
+        return 0, 0, warns
+    added = overridden = 0
+    for name, spec in items.items():
+        name = str(name).strip()
+        if not name or not isinstance(spec, dict):
+            warns.append("跳过非法条目: %r" % (name,))
+            continue
+        shaft = str(spec.get("shaft") or "").strip().upper()
+        if shaft not in BEARING_SHAFTS:
+            warns.append("%s: shaft 必须是 %s 之一，实际 %r" % (name, "/".join(BEARING_SHAFTS), shaft))
+            continue
+        mult = {}
+        for k in ("BPFI", "BPFO", "BSF", "FTF"):
+            v = spec.get(k)
+            if v is None or str(v).strip() == "":
+                continue
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                warns.append("%s: %s=%r 不是数字" % (name, k, v))
+                continue
+            if v > 0:
+                mult[k] = v
+        if not mult:
+            warns.append("%s: 没有任何有效倍数，已跳过" % name)
+            continue
+        overridden += 1 if name in BEARING_LIB else 0
+        added += 0 if name in BEARING_LIB else 1
+        BEARING_LIB[name] = (shaft, mult)
+    BEARING_LIB_WARNINGS.extend(warns)
+    return added, overridden, warns
+
+
+load_bearing_lib()
+
 _WF_POINTS = [
     ("主轴轴承", ["五峰行星架前 NCF28/750"]),
     ("齿轮箱输入端", ["五峰低速轴前 NU1080"]),
