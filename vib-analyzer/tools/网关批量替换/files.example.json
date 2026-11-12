@@ -1,0 +1,14 @@
+[
+  {
+    "src": "C:/部署包/网关/collector.conf",
+    "dst": "/opt/gateway/conf/collector.conf",
+    "mode": "644",
+    "owner": "root:root",
+    "restart": "systemctl restart gateway-collector"
+  },
+  {
+    "src": "C:/部署包/网关/gateway.bin",
+    "dst": "/opt/gateway/bin/gateway.bin",
+    "mode": "755"
+  }
+]

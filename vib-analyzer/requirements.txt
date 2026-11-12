@@ -5,3 +5,5 @@ matplotlib
 tkcalendar
 openpyxl
 xlrd>=2.0
+python-docx
+pyinstaller

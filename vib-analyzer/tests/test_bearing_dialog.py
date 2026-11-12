@@ -49,6 +49,9 @@ def run_case(rpm_text, custom):
     ERRORS.clear()
     root = tk.Tk(); root.withdraw(); _root = root
     root._bearing_sel = None
+    root.info = {"project": "田家寨"}                # 机型按项目名匹配（数据\机型库.json）
+    root._machine_name = None
+    root.current_machine = lambda: vib.machine_for_project("田家寨")
     root._get_rot_hz = lambda: 25.0                  # 1500 rpm
     root._redraw_current_plot = lambda: None
     root._bearing_shaft_freqs = lambda f: vib.SpectrumWindow._bearing_shaft_freqs(root, f)
@@ -81,6 +84,8 @@ def main():
     marks2, sel = run_case("1500", {"BPFI": "8.5"})
 
     probe = tk.Tk(); probe.withdraw()
+    probe.info = {"project": "田家寨"}
+    probe.current_machine = lambda: vib.machine_for_project("田家寨")
     shaft, mult = vib.BEARING_LIB[sel]
     base = vib.SpectrumWindow._bearing_shaft_freqs(probe, 1500 / 60.0)[shaft]
     probe.destroy()

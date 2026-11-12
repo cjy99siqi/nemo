@@ -299,15 +299,30 @@ def _fill_conclusions(doc, agg):
             continue
         bad = [pt for pt, d in agg[u].items() if d["grade"] == "警告"]
         if bad:
-            _repl_para(p, "%s 存在轴承故障特征（%s），等级：警告。"
-                       % (bad[0], agg[u][bad[0]].get("fault_lab", "")))
+            d = agg[u][bad[0]]
+            _g = d.get("gear_lab") or ""
+            _pt = _cnname(bad[0])
+            if d.get("fault"):
+                _txt = "%s 存在轴承故障特征（%s），等级：警告。" % (_pt, d.get("fault_lab", ""))
+                if _g:
+                    _txt += "同时该测点齿轮啮合异常：%s。" % _g
+            elif _g:
+                _txt = "%s 存在齿轮啮合异常特征（%s），等级：警告。" % (_pt, _g)
+            else:
+                _txt = "%s 存在故障特征，等级：警告。" % _pt
+            _repl_para(p, _txt)
         else:
             dbs = [pt for pt, d in agg[u].items() if d.get("data_bad")]
+            _gears = [(pt, d) for pt, d in agg[u].items() if d.get("gear_lab")]
             if dbs:
                 d = agg[u][dbs[0]]
                 _repl_para(p, "机组传动链运行正常；%s（最大 %.4f m/s²，仅为同型机组的 %.0f%%）测点数据异常，"
                               "疑似传感器安装或采集通道问题，建议重新安装并核查该测点。"
-                           % (dbs[0], d["max"], 100.0 * d["max"] / max(1e-9, d["peer_med"])))
+                           % (_cnname(dbs[0]), d["max"], 100.0 * d["max"] / max(1e-9, d["peer_med"])))
+            elif _gears:
+                _pt, _d = _gears[0]
+                _repl_para(p, "机组传动链运行基本正常；%s 齿轮啮合边带有所抬升（%s），等级：关注，"
+                              "建议下次检测复核该测点。" % (_cnname(_pt), _d.get("gear_lab", "")))
             else:
                 _repl_para(p, "机组传动链运行正常。")
 

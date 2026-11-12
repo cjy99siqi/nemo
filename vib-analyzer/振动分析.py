@@ -8,9 +8,34 @@
       / 自相关点选谱峰→基频→时域自动按周期标注
       / 自相关结果缓存+主线程轮询(修掉旧结果覆盖新图、工作线程碰 Tk、重复重算等问题)
 """
-import os, sys, json, re, shutil, time, tkinter as tk
+import os, sys, json, re, shutil, time, io, csv, tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from tkcalendar import DateEntry
+
+
+def _safe_dateentry_press(self, event):
+    """只在“下拉箭头”区域打开日历。
+
+    tkcalendar 1.5 的默认实现用 identify()==_downarrow_name 判断，而 _downarrow_name
+    在控件未映射/主题特殊时可能一直是空串 ''，此时“点条目任意位置都等于箭头”，
+    日历就会莫名弹出。这里加两层保险：已知箭头名才按 identify，否则只认最右侧 26px。
+    """
+    try:
+        if "disabled" in self.state():
+            return
+        name = getattr(self, "_downarrow_name", "") or ""
+        if name:
+            hit = (self.identify(event.x, event.y) == name)
+        else:
+            hit = event.x >= (self.winfo_width() - 26)
+        if hit:
+            self.state(["pressed"])
+            self.drop_down()
+    except Exception:
+        pass
+
+
+DateEntry._on_b1_press = _safe_dateentry_press
 import numpy as np
 import pandas as pd
 from scipy.signal import butter, filtfilt, sosfiltfilt, spectrogram, hilbert, find_peaks, resample
@@ -24,6 +49,9 @@ from datetime import datetime, date, timedelta
 import threading
 import sqlite3
 import zipfile
+import zlib
+import struct
+import traceback
 
 
 def enable_dpi_awareness():
@@ -62,56 +90,50 @@ else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 STATE_FILE = os.path.join(APP_DIR, "gui_state.json")
+LOG_DIR = os.path.join(APP_DIR, "logs")
+ERROR_LOG = os.path.join(LOG_DIR, "vib_error.log")
+
+
+def log_error(tag, exc=None):
+    """把被吞掉的异常写到 logs/vib_error.log（界面不弹窗，事后能查）。
+
+    只在“出错但能继续”的地方调用；超过 512KB 自动轮转成 .1，
+    避免常年运行把日志撑爆。
+    """
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        if os.path.exists(ERROR_LOG) and os.path.getsize(ERROR_LOG) > 512 * 1024:
+            os.replace(ERROR_LOG, ERROR_LOG + ".1")
+        detail = ""
+        if exc is not None:
+            detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            line = "[%s] %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), tag)
+            if detail:
+                line += chr(10) + detail
+            f.write(line + chr(10))
+    except Exception:
+        pass
+
+
 CACHE_SUFFIX = ".vibcache.json"
+# 数据量级合理性阈值（加速度 m/s²）：风电测点正常峰值 <20、带内 RMS <10。
+# 五峰那批数据约 1% 采样顶到 ±245（疑似传感器饱和/单位不对），峰值 45~245、带内 RMS 最高 19，
+# 混进趋势会把整条曲线带偏，所以超过阈值直接拒收、也不允许再入库。
+# 阈值取“明显触顶”而非“略高”：府谷正常冲击数据峰值能到 160~180，不能误杀。
+ABNORMAL_PEAK = 200.0
+ABNORMAL_RMS = 20.0
 ANNOT_FILE = "vib_annotations.json"   # 按测点保存基频/倍频/边带/带宽标注
 SUMMARY_FILE = "trend_summary.json"  # 趋势汇总缓存，避免遍历几千个小json
 DB_FILE = "vib_cache.db"             # SQLite 趋势缓存库（取代大汇总 JSON，启动秒开）
 DB_SCHEMA_VERSION = 2                # SQLite 表结构版本；VDI_VERSION 控制数据内容版本
-# 明阳 MY2.0 齿轮箱链（与 明阳2.0MW.xlsx 一致）：高速轴→中速轴→太阳轮→低速轴/行星架
-GB_I3 = 112.0 / 23.0        # 三级 4.8696
-GB_I2 = 113.0 / 24.0        # 二级 4.7083
-GB_I1 = 1.0 + 109.0 / 23.0  # 一级行星 5.7391
-GB_ZR, GB_ZP = 109.0, 43.0
+# 轴承特征频率库：名称 -> (所在轴, {特征: 倍数})。
+# 轴代号：L=主轴/行星架 S=低速轴(太阳轮) M=中速轴 H=高速轴/电机 P=行星轮(相对行星架)
+# 数据全部来自 数据\轴承库.json（load_bearing_lib 启动时载入）；代码里不再内置任何机型的数据，
+# 齿轮比也一样——见下面的 数据\机型库.json，每个项目/机型各有一套。
+BEARING_LIB = {}
 
-# 轴承特征频率倍数（明阳 2.0MW 库）：名称 -> (所在轴, {特征: 倍数})
-# 轴代号：L=低速轴/行星架 S=太阳轮/低速轴 M=中速轴 H=高速轴/电机 P=行星轮(相对行星架)
-BEARING_LIB = {
-    "主轴 N1 F-612211": ("L", {"BPFI": 14.18, "BPFO": 11.82, "FTF": 0.455, "BSF": 5.46}),
-    "行星轮 N2 NNCF5052": ("P", {"BPFI": 13.56, "BPFO": 12.44, "BSF": 5.71}),
-    "低速轴前 N3 NU1080": ("S", {"BPFI": 14.3, "BPFO": 11.7, "FTF": 0.45, "BSF": 4.95}),
-    "低速轴后 N4 LM567949": ("S", {"BPFI": 10.404, "BPFO": 7.596, "BSF": 3.623}),
-    "中速轴前 N5 NU2244": ("M", {"BPFI": 8.794, "BPFO": 6.206, "FTF": 0.414, "BSF": 2.811}),
-    "中速轴后 N6 30244": ("M", {"BPFI": 12.0, "BPFO": 9.0, "BSF": 3.48}),
-    "中速轴后 N6b /32244": ("M", {"BPFI": 12.5, "BPFO": 9.5, "BSF": 3.63}),
-    "高速轴前 N7 NU2236": ("H", {"BPFI": 10.352, "BPFO": 7.648, "FTF": 0.43, "BSF": 3.254}),
-    "高速轴后 N8 QJ332": ("H", {"BPFI": 7.0923, "BPFO": 4.9077, "FTF": 0.409, "BSF": 4.35}),
-    "高速轴后 N9 NU234": ("H", {"BPFI": 10.352, "BPFO": 7.667, "FTF": 0.43, "BSF": 3.3009}),
-    "电机前 B12 6332MC4": ("H", {"BPFI": 4.813, "BPFO": 3.187, "FTF": 0.400, "BSF": 2.360}),
-    "电机前 B13 6332MC4": ("H", {"BPFI": 4.813, "BPFO": 3.187, "FTF": 0.400, "BSF": 2.360}),
-    "电机后 6332MC4": ("H", {"BPFI": 4.813, "BPFO": 3.187, "FTF": 0.400, "BSF": 2.360}),
-    "电机 SKF6334": ("H", {"BPFI": 4.838, "BPFO": 3.162, "FTF": 0.395, "BSF": 2.28}),
-}
-# 五峰（运达 2.0MW / 南高齿 FD2250Z）轴承库：附件2《运达各类型机组振动档案库.xls》2000kW 页
-# 附件2 给出的是额定转速下的绝对频率(Hz)，这里除以所在轴转频换算成“倍数”，与明阳库同口径。
-# 轴转频：行星架 0.229709、低速轴 1.286371、中速轴 5.75804、高速轴 29.989791、电机 30.0 Hz
-_WF_LIB = {
-    "五峰行星架前 NCF28/750": ("P", {"BPFO": 27.5, "BPFI": 30.6}),
-    "五峰行星轮 NNCF5044": ("P", {"BPFO": 26.8, "BPFI": 34.8}),
-    "五峰行星架后 NCF18/630": ("P", {"BPFO": 29.0, "BPFI": 32.1}),
-    "五峰低速轴前 NU1080": ("S", {"BPFO": 11.74, "BPFI": 14.30, "FTF": 0.451, "BSF": 9.93}),
-    "五峰低速轴后 LM567949": ("S", {"BPFO": 19.12, "BPFI": 22.00, "FTF": 0.466, "BSF": 14.02}),
-    "五峰中速轴后 30244": ("M", {"BPFO": 8.58, "BPFI": 11.43, "FTF": 0.429, "BSF": 6.63}),
-    "五峰中速轴后2 32244": ("M", {"BPFO": 9.07, "BPFI": 11.93, "FTF": 0.432, "BSF": 6.91}),
-    "五峰高速轴前 NU2236": ("H", {"BPFO": 7.65, "BPFI": 10.36, "FTF": 0.423, "BSF": 6.51}),
-    "五峰高速轴后 NU2230": ("H", {"BPFO": 8.16, "BPFI": 10.85, "FTF": 0.430, "BSF": 6.93}),
-    "五峰高速轴后2 QJ330": ("H", {"BPFO": 5.42, "BPFI": 7.58, "FTF": 0.417, "BSF": 4.80}),
-    # 发电机（附件2“发电机振动参数”：永济 6332 M.C4 / 湘电 6334 M/C3，1800rpm 绝对Hz）
-    "五峰发电机 6332M C4": ("H", {"BPFO": 3.187, "BPFI": 4.813, "FTF": 0.400, "BSF": 4.72}),
-    "五峰发电机 6334M C3": ("H", {"BPFO": 3.160, "BPFI": 4.840, "FTF": 0.397, "BSF": 4.56}),
-}
-BEARING_LIB.update(_WF_LIB)
-
-# 外部轴承库：数据\轴承库.json（可选）。存在则合并进 BEARING_LIB：
+# 外部轴承库：数据\轴承库.json。启动时载入（tools\build_libs.py 生成）：
 #   同名轴承 → 用文件里的值覆盖；新名字 → 追加。
 # 结构：
 #   {"version": 1,
@@ -179,14 +201,161 @@ def load_bearing_lib(path=None):
 
 load_bearing_lib()
 
-_WF_POINTS = [
-    ("主轴轴承", ["五峰行星架前 NCF28/750"]),
-    ("齿轮箱输入端", ["五峰低速轴前 NU1080"]),
-    ("齿轮箱一级齿圈", ["五峰行星架前 NCF28/750"]),
-    ("齿轮箱高速轴", ["五峰高速轴前 NU2236", "五峰高速轴后 NU2230"]),
-    ("发电机前轴", ["五峰发电机 6332M C4", "五峰发电机 6334M C3"]),
-    ("发电机后轴", ["五峰发电机 6332M C4", "五峰发电机 6334M C3"]),
-]
+
+# ---- 机型库：数据\机型库.json ----------------------------------------------
+# 每个项目/机型各有一套参数，代码里不再内置任何机型的齿轮比：
+#   {"version": 1, "machines": {"机型名": {
+#        "projects": ["项目名关键字", ...],            # 文件名里的项目段含关键字即命中
+#        "shafts":   {"H": 1.0, "M": .., "S": .., "L": .., "P": ..},   # 各轴转频 ÷ 高速轴转频
+#        "gears":    [{"name": "一级行星（92齿 × 行星架）", "teeth": 92,
+#                      "shaft": "L", "sideband": "L"}, ...],
+#        "points":   [["测点名关键字", ["轴承名", ...]], ...]}}}
+# 由 tools\build_libs.py 从现场的机组参数表生成，也可以手工编辑。
+MACHINE_LIB_FILE = os.path.join(APP_DIR, "数据", "机型库.json")
+MACHINE_LIB = {}                 # 机型名 -> profile（见上）
+MACHINE_LIB_WARNINGS = []
+AUTO_MACHINE = "（按项目自动）"   # 对话框里“不手选机型”的占位项
+
+
+def load_machine_lib(path=None):
+    """读 数据\机型库.json，返回 (机型数, warnings)。文件不存在视为没有机型库。"""
+    path = path or MACHINE_LIB_FILE
+    warns = []
+    if not os.path.exists(path):
+        return 0, warns
+    try:
+        with open(path, encoding="utf-8-sig") as fp:
+            doc = json.load(fp)
+    except Exception as e:
+        warns.append("机型库读取失败(%s): %s" % (os.path.basename(path), e))
+        MACHINE_LIB_WARNINGS.extend(warns)
+        return 0, warns
+    items = doc.get("machines") if isinstance(doc, dict) else None
+    if not isinstance(items, dict):
+        warns.append("机型库格式错误：缺少 machines 对象")
+        MACHINE_LIB_WARNINGS.extend(warns)
+        return 0, warns
+
+    loaded = 0
+    for name, spec in items.items():
+        name = str(name).strip()
+        if not name or not isinstance(spec, dict):
+            warns.append("跳过非法机型条目: %r" % (name,))
+            continue
+        shafts = {}
+        for k, v in (spec.get("shafts") or {}).items():
+            k = str(k).strip().upper()
+            if k not in BEARING_SHAFTS:
+                warns.append("%s: 轴代号 %r 非法（应为 %s）" % (name, k, "/".join(BEARING_SHAFTS)))
+                continue
+            fv = None
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                fv = None
+            if not fv or fv <= 0:
+                warns.append("%s: %s 的转频比 %r 不是正数" % (name, k, v))
+                continue
+            shafts[k] = fv
+        if "H" not in shafts:
+            warns.append("%s: 缺少高速轴转频比（shafts.H=1），整条跳过" % name)
+            continue
+        gears = []
+        for g in spec.get("gears") or []:
+            if not isinstance(g, dict):
+                warns.append("%s: 齿轮条目不是对象，已跳过" % name)
+                continue
+            try:
+                teeth = float(g.get("teeth"))
+            except (TypeError, ValueError):
+                warns.append("%s: 齿轮齿数 %r 不是数字" % (name, g.get("teeth")))
+                continue
+            sh = str(g.get("shaft") or "").strip().upper()
+            if teeth <= 0 or sh not in shafts:
+                warns.append("%s: 齿轮 %r 齿数或所在轴非法，已跳过" % (name, g.get("name")))
+                continue
+            sb = str(g.get("sideband") or sh).strip().upper()
+            item = {"name": str(g.get("name") or ("%d齿" % teeth)).strip(),
+                    "teeth": teeth, "shaft": sh,
+                    "sideband": sb if sb in shafts else sh}
+            # 可选判读参数：齿数公约数（边带间隔可能是 GMF/n）、行星轮个数
+            for key in ("gcd", "planets"):
+                try:
+                    iv = int(g.get(key))
+                except (TypeError, ValueError):
+                    continue
+                if iv >= 2:
+                    item[key] = iv
+            gears.append(item)
+        points = []
+        for p in spec.get("points") or []:
+            if (isinstance(p, (list, tuple)) and len(p) == 2
+                    and isinstance(p[1], (list, tuple))):
+                kw = str(p[0]).strip()
+                names = [str(x).strip() for x in p[1] if str(x).strip()]
+                if kw and names:
+                    points.append((kw, names))
+                else:
+                    warns.append("%s: 测点映射 %r 为空，已跳过" % (name, p))
+            else:
+                warns.append("%s: 测点映射应为 [关键字, [轴承名...]]，实际 %r" % (name, p))
+        # 引用的轴承必须真实存在，否则画图时静默少几条线，很难发现
+        for kw, names in points:
+            for b in names:
+                if b not in BEARING_LIB:
+                    warns.append("%s: 测点「%s」引用的轴承「%s」不在 数据\\轴承库.json 里"
+                                 % (name, kw, b))
+        MACHINE_LIB[name] = {
+            "name": name,
+            "projects": [str(x).strip() for x in (spec.get("projects") or []) if str(x).strip()],
+            "shafts": shafts, "gears": gears, "points": points,
+        }
+        loaded += 1
+    MACHINE_LIB_WARNINGS.extend(warns)
+    return loaded, warns
+
+
+def machine_for_project(project):
+    """按项目名挑机型，返回 (机型名, profile)；没有匹配返回 (None, None)。
+
+    先比 projects 里登记的项目名关键字，再退一步比机型名本身（现场目录常直接叫
+    “岑港”“EN87” 这种）。
+    """
+    proj = str(project or "")
+    if not proj:
+        return None, None
+    for name, prof in MACHINE_LIB.items():
+        for kw in prof["projects"]:
+            if kw and kw in proj:
+                return name, prof
+    for name, prof in MACHINE_LIB.items():
+        if name and name in proj:
+            return name, prof
+    return None, None
+
+
+def profile_for_project(project):
+    return machine_for_project(project)[1]
+
+
+def machine_names():
+    return list(MACHINE_LIB.keys())
+
+
+def shaft_freqs(rpm, machine=None):
+    """高速轴(发电机)转速(rpm) -> 各轴转频 dict。machine 可以是机型名、profile 或 None。
+
+    没有机型（未识别项目且未手选）时只返回高速轴，别的轴宁可不画也不猜。
+    """
+    fH = float(rpm or 0) / 60.0
+    prof = MACHINE_LIB.get(machine) if isinstance(machine, str) else machine
+    ratios = (prof or {}).get("shafts") or {}
+    if not ratios:
+        return {"H": fH} if fH > 0 else {}
+    return {k: fH * float(r) for k, r in ratios.items()}
+
+
+load_machine_lib()
 
 # 五峰测点采集异常清单（2026-03 全月抽样比对，偏离同型中位 10 倍以上）：
 # 这些测点数据不参与分析/入库，避免误判。格式 {机组: [测点, ...]}
@@ -203,6 +372,135 @@ WF_BAD_POINTS = {
 }
 WF_BAD_POINTS_NOTE = "13#高速轴/22#一级齿圈/27#主轴轴承/15#输入端 为断线或严重干扰；14#高速轴、30#一级齿圈/发电机前后轴 为 48~50Hz 工频干扰"
 
+def bearing_tag(name):
+    """同一测点挂多个轴承时，给标注加一个短前缀区分类别（型号里的数字）。"""
+    nm = str(name or "")
+    if "B12" in nm or "B13" in nm:
+        return "6332"                    # 明阳 B12/B13 同为 6332MC4，倍数一致
+    mm = re.search(r"(\d{4})", nm)
+    if mm:
+        return mm.group(1)
+    if "SKF" in nm:
+        return "SKF"
+    return ""
+
+
+BEARING_ORDER_CN = {"BPFO": "外圈", "BPFI": "内圈", "BSF": "滚动体", "FTF": "保持架"}
+
+
+def _peak_near(f, amp, hz, tol_hz):
+    """hz±tol 内的最高峰，返回 (幅值, 峰频率)。"""
+    if hz <= 0 or f.size == 0:
+        return 0.0, 0.0
+    m = (f >= hz - tol_hz) & (f <= hz + tol_hz)
+    if not m.any():
+        return 0.0, 0.0
+    idx = np.where(m)[0]
+    i = int(idx[int(np.argmax(amp[idx]))])
+    return float(amp[i]), float(f[i])
+
+
+def bearing_family_match(f, amp, sh, names, tol=0.03, max_k=6):
+    """包络谱上按“谐波族”给每只候选轴承的每个阶次打分，返回最佳匹配。
+
+    为什么不只看单峰：BPFI ≈ 2×BSF 时，2×BSF 那一根会被误认成 BPFI 基频。
+    这里要求 1× 落在 ±tol 内、2×…6× 逐阶去找，族里命中的阶数越多、偏差越一致分越高：
+        score = 1×幅值 × (1 + 0.5·h2 + 0.3·h3 + 0.15·(4~6× 命中数)) × 一致性
+    返回 {bearing, key, hz, amp, amp2, amp3, dev, hits, score, all}；all 为全部候选（降序）。
+    """
+    scored = []
+    if f is None or amp is None or len(f) < 16 or not names:
+        return None
+    fmax = float(f[-1])
+    for nm in names:
+        brg = BEARING_LIB.get(nm)
+        if not brg:
+            continue
+        code, mult = brg
+        try:
+            base = float(sh.get(code, 0.0) or 0.0)
+        except Exception:
+            base = 0.0
+        if base <= 0:
+            continue
+        for key in ("BPFO", "BPFI", "BSF"):
+            m = float(mult.get(key) or 0.0)
+            if m <= 0:
+                continue
+            t1 = m * base
+            if t1 <= 0 or t1 > fmax:
+                continue
+            a1, p1 = _peak_near(f, amp, t1, max(min(tol * t1, 0.35 * t1), 0.5))
+            if a1 <= 0:
+                continue
+            dev1 = (p1 - t1) / t1
+            if abs(dev1) > tol:
+                continue
+            amps = [a1]
+            devs = [dev1]
+            hits = 1
+            for k in range(2, int(max_k) + 1):
+                tk = t1 * k
+                if tk > fmax:
+                    break
+                ak, pk = _peak_near(f, amp, tk, max(min(tol * tk, 0.35 * t1), 0.5))
+                amps.append(ak)
+                if ak >= 0.15 * a1:
+                    hits += 1
+                    devs.append((pk - tk) / tk)
+            h2 = min(amps[1] / a1, 1.0) if len(amps) > 1 else 0.0
+            h3 = min(amps[2] / a1, 1.0) if len(amps) > 2 else 0.0
+            extra = sum(1 for a in amps[3:] if a >= 0.15 * a1)
+            spread = (max(devs) - min(devs)) if devs else 0.0
+            consist = max(0.0, 1.0 - 0.5 * spread / max(tol, 1e-9))
+            score = a1 * (1.0 + 0.5 * h2 + 0.3 * h3 + 0.15 * extra) * consist
+            scored.append({"bearing": nm, "key": key, "hz": t1, "amp": a1,
+                           "amp2": amps[1] if len(amps) > 1 else 0.0,
+                           "amp3": amps[2] if len(amps) > 2 else 0.0,
+                           "hits": hits, "dev": dev1, "score": float(score)})
+    if not scored:
+        return None
+    scored.sort(key=lambda x: -x["score"])
+    best = dict(scored[0])
+    best["all"] = scored
+    # 两只轴承/两个阶次分数接近时标出来，结论里提示“两解”
+    best["ambiguous"] = bool(len(scored) > 1 and
+                             scored[1]["score"] >= 0.85 * scored[0]["score"]
+                             and (scored[1]["bearing"] != scored[0]["bearing"]
+                                  or scored[1]["key"] != scored[0]["key"]))
+    return best
+
+
+def bearing_hint(hz, sh, names, tol=0.03):
+    """某个频率最像哪只轴承的哪个阶次（谱图卡用）：返回 (轴承, 阶次, 理论Hz, 偏差) 或 None。"""
+    best = None
+    try:
+        hz = float(hz)
+    except Exception:
+        return None
+    if hz <= 0 or not names:
+        return None
+    for nm in names:
+        brg = BEARING_LIB.get(nm)
+        if not brg:
+            continue
+        code, mult = brg
+        base = float(sh.get(code, 0.0) or 0.0)
+        if base <= 0:
+            continue
+        for key in ("BPFO", "BPFI", "BSF", "FTF"):
+            m = float(mult.get(key) or 0.0)
+            if m <= 0:
+                continue
+            t = m * base
+            if t <= 0:
+                continue
+            dev = (hz - t) / t
+            if abs(dev) <= tol and (best is None or abs(dev) < abs(best[3])):
+                best = (nm, key, t, dev)
+    return best
+
+
 def wf_bad_point(project, unit, point):
     """五峰项目里被判定为采集错误的测点：返回 True 表示该测点数据不可信、不参与分析。"""
     proj = str(project or "")
@@ -216,38 +514,457 @@ def wf_bad_point(project, unit, point):
     return any(k in pt for k in bad)
 
 
+# --------------------------------------------------------------------------- #
+# 齿轮啮合边带判读（《齿轮啮合图谱经验》§3/§4）
+# 现场做法：在 GMF 两侧找峰，量相邻间隔，再拿间隔去比“各轴转频 / GMF÷公约数 /
+# GMF÷行星轮数 / N×太阳轮自转”——对上了哪一条，故障就在哪个齿轮上。
+# --------------------------------------------------------------------------- #
+def _spectrum_peaks(f, amp, lo, hi, prom):
+    """窗口内找峰，返回 [(hz, amp)]。"""
+    m = (f >= lo) & (f <= hi)
+    fw, aw = f[m], amp[m]
+    if fw.size < 8:
+        return []
+    idx, _ = find_peaks(aw, prominence=prom)
+    return [(float(fw[i]), float(aw[i])) for i in idx]
+
+
+def sideband_scan(f, amp, center, span=None, ratio=0.55, prom_ratio=0.12):
+    """在 GMF 两侧找峰：返回 {center_amp, peaks}，peaks 已去掉 GMF 自身。
+
+    span 为搜索半宽；不传时按 GMF 的 ±55%。GMF/3 这类族线跨到 GMF/3 处，
+    所以调用方通常会按最大候选间隔放大 span。
+    """
+    try:
+        f = np.asarray(f, dtype=float)
+        amp = np.asarray(amp, dtype=float)
+        if f.size < 50 or not center or center <= 0:
+            return None
+        i0 = int(np.argmin(np.abs(f - center)))
+        c_amp = float(amp[max(0, i0 - 3):min(len(amp), i0 + 4)].max())
+        if c_amp <= 0:
+            return None
+        span = float(span) if span else center * float(ratio)
+        lo, hi = max(0.0, center - span), center + span
+        pk = _spectrum_peaks(f, amp, lo, hi, prom=c_amp * float(prom_ratio))
+        # 排除 GMF 自身与各次谐波：2×GMF 是谐波不是边带，留着会冒充“间隔=GMF/3×3”
+        pk = [p for p in pk
+              if abs(p[0] - center) > 0.01 * center
+              and all(abs(p[0] - center * m) > 0.02 * center * m for m in (2, 3, 4))]
+        return {"center_amp": c_amp, "peaks": pk}
+    except Exception:
+        return None
+
+
+def gear_sideband_verdict(f, amp, mesh, candidates, max_k=3, tol=0.02, prom_ratio=0.12):
+    """把每个候选间隔套到 GMF 两侧，看哪条能对上最多的边带峰。
+
+    candidates = [(标签, Hz)]，标签如「中速轴转频」「GMF/3」「3×太阳轮」。
+    比“相邻峰间隔中位数”稳：谱线密（泄漏峰多）时中位数会被噪声带跑，
+    这里要求候选在 GMF±k×间隔处**真的能点到峰**，且至少 2 处命中才算数。
+
+    返回 {match, spacing(实测), match_hz(标称), ratio, hits, center_amp, peaks}。
+    """
+    empty = {"match": None, "spacing": 0.0, "match_hz": 0.0, "ratio": 0.0,
+             "hits": [], "center_amp": 0.0, "peaks": []}
+    subs = [(lbl, float(hz)) for lbl, hz in candidates if hz and hz > 0]
+    if not subs:
+        return empty
+    try:
+        fa = np.asarray(f, dtype=float)
+        df = float(np.median(np.diff(fa))) if fa.size > 2 else 0.0
+    except Exception:
+        df = 0.0
+    # 搜索窗口要盖住最大候选的 ±max_k 根边带（GMF/3 族会一直铺到 GMF/3 处）
+    hz_max = max(hz for _l, hz in subs)
+    span = max(mesh * 0.55, float(max_k) * hz_max * 1.05)
+    # 中心吸附：文件名里的转速是整数、齿数也是标称值，真实啮合峰常偏 1–2%，
+    # 先把中心挪到 ±1.5% 内最强的那个峰，再按它算边带，否则整族都差几 Hz。
+    center = float(mesh)
+    try:
+        fa = np.asarray(f, dtype=float)
+        aa = np.asarray(amp, dtype=float)
+        near = np.abs(fa - mesh) <= max(0.015 * mesh, 1.5)
+        if near.any():
+            i = int(np.argmax(aa[near]))
+            pk_hz = float(fa[near][i])
+            pk_amp = float(aa[near][i])
+            bg = float(np.median(aa[near])) or 0.0
+            if pk_amp >= max(1.5 * bg, 1e-12):
+                center = pk_hz
+    except Exception:
+        pass
+    scan = sideband_scan(f, amp, center, span=span, prom_ratio=prom_ratio)
+    if not scan or not scan["peaks"]:
+        return empty
+    c_amp, peaks = scan["center_amp"], scan["peaks"]
+    best = None
+    for label, hz in subs:
+        if not hz or hz <= 0:
+            continue
+        # 间隔小于一个谱线宽就分辨不出来，不参与匹配（否则会“命中”到邻近噪声峰）
+        if df and hz < 1.5 * df:
+            continue
+        hits = []
+        for k in range(1, int(max_k) + 1):
+            for sign in (-1, 1):
+                tgt = center + sign * k * hz
+                if tgt <= 0:
+                    continue
+                # 容差：按谱线宽的倍数收口，且不得跨到相邻阶（0.30×间隔）
+                tol_hz = min(max(1.5 * df, 0.0015 * tgt), 0.30 * hz)
+                cand = [p for p in peaks if abs(p[0] - tgt) <= tol_hz]
+                if cand:
+                    hits.append((k, sign, max(cand, key=lambda x: x[1])))
+        if len(hits) < 2:
+            continue
+        score = len(hits) + 0.5 * sum(h[2][1] for h in hits) / c_amp
+        if best is None or score > best[0]:
+            best = (score, label, hz, hits)
+    if best is None:
+        pk = max(peaks, key=lambda x: x[1])
+        gap = abs(pk[0] - center)
+        # 只有一侧对得上时，给个“≈N×某转频（仅一侧）”的提示，比干巴巴“未对上”有用
+        weak = None
+        for label, hz in subs:
+            if not hz or hz <= 0:
+                continue
+            for k in range(1, int(max_k) + 1):
+                if abs(gap - k * hz) <= min(max(1.5 * df, 0.0015 * gap), 0.30 * hz):
+                    weak = label if k == 1 else "%s×%d" % (label, k)
+                    break
+            if weak:
+                break
+        return {"match": None, "weak": weak, "spacing": gap, "match_hz": 0.0,
+                "center_hz": center, "ratio": pk[1] / c_amp, "hits": [],
+                "center_amp": c_amp, "peaks": peaks}
+    _score, label, hz, hits = best
+    # 报“对上的那个间隔”（候选值），另记实测偏差，避免出现 5.51≈4.97 这种自相矛盾的展示
+    misalign = float(np.median([abs(h[2][0] - (center + h[1] * h[0] * hz)) for h in hits]))
+    return {"match": label, "spacing": float(hz), "match_hz": float(hz),
+            "center_hz": center, "misalign": misalign,
+            "ratio": max(h[2][1] for h in hits) / c_amp,
+            "hits": [(h[0], h[1], h[2][0], h[2][1]) for h in hits],
+            "center_amp": c_amp, "peaks": peaks}
+
+
 BEARING_COLORS = {"BPFI": "#c62828", "BPFO": "#1565c0", "BSF": "#2e7d32", "FTF": "#6a1b9a"}
 
-# 齿轮级定义（明阳 2.0MW 齿轮箱）：(显示名, 轴代号, 齿数, 边带所在轴)
-# 一级行星：啮合 = 内齿圈109 × 行星架(低速轴)转频；二级：113齿在低速轴；三级：112齿在中速轴
-GEAR_STAGES = [
-    ("一级行星（109齿 × 行星架转频）", "L", 109.0, "L"),
-    ("二级（113齿 × 低速轴转频）", "S", 113.0, "S"),
-    ("三级（112齿 × 中速轴转频）", "M", 112.0, "M"),
-]
-GEAR_COLOR = "#d35400"       # 啮合频率
-GEAR_SB_COLOR = "#e8a06a"    # 边带
 
-# 哪个项目用这套轴承库（明阳2.0MW）。项目名里含关键字即生效；其它项目（如五峰/田家寨）不自动标注。
-# 每条： (测点名里含的关键字, [轴承名...])，按顺序匹配，先匹配到的生效。
-_FUGU_POINTS = [
-    ("主轴承", ["主轴 N1 F-612211"]),
-    ("行星轮", ["行星轮 N2 NNCF5052"]),
-    ("低速轴前", ["低速轴前 N3 NU1080"]),
-    ("低速轴后", ["低速轴后 N4 LM567949"]),
-    ("中速轴前", ["中速轴前 N5 NU2244"]),
-    ("中速轴后", ["中速轴后 N6 30244"]),
-    ("高速轴径向", ["高速轴后 N9 NU234"]),
-    ("高速轴轴向", ["高速轴后 N9 NU234"]),
-    ("中部径向", ["中速轴前 N5 NU2244"]),
-    ("一级内齿圈", ["低速轴前 N3 NU1080"]),
-    # 发电机前/后轴承都可能是 6332MC4（B12、B13 是同一型号、倍数一致）或 SKF6334
-    ("发电机前轴承", ["电机前 B12 6332MC4", "电机 SKF6334"]),
-    ("发电机后轴承", ["电机后 6332MC4", "电机 SKF6334"]),
-    ("发电机", ["电机前 B12 6332MC4", "电机 SKF6334"]),
-]
-# 同一套库对应多个项目名：府谷（原称）、田家寨（现场名）、五峰（运达 2.0MW / 南高齿 FD2250Z）
-BEARING_PROJECT_MAP = {"府谷": _FUGU_POINTS, "田家寨": _FUGU_POINTS, "五峰": _WF_POINTS}
+# --------------------------------------------------------------------------- #
+# 故障模式判定（频谱形态 → 疑似故障类型）
+# 依据是现场判读经验：转频 1X/2X、GMF 谐波族、边带数量与间隔、次谐波、宽带本底、
+# 时域冲击。这里只做“证据 → 疑似”，结论永远带依据，不做硬结论。
+# 阈值集中在 FAULT_MODE_T，现场跑一轮再微调。
+# --------------------------------------------------------------------------- #
+FAULT_MODE_T = {
+    "one_x": 0.60,      # 1X ≥ 60% GMF 才算“转频占主导”（单频谱无基线，门槛宁高勿低）
+    "one_x_sig": 8.0,   # 1X 还要比邻域中位高 8 倍
+    "two_x_hi": 1.10,   # 2X/1X ≥ 1.1 → 2X 反超（轴弯曲特征）
+    "harm_hi": 0.15,    # 谐波 ≥ 15% GMF 视为“抬升”
+    "wear_r2": 0.25,    # 均匀磨损要求 2×GMF ≥ 25%
+    "sb_dense": 5,      # 边带命中 ≥5 处 = 浓密
+    "sb_sparse": 2,     # ≤2 处 = 稀疏
+    "hf_floor": 0.35,   # 高频本底 ≥35% GMF 视为“宽带抬高”
+    "kurt_hi": 4.5,     # 峭度 ≥4.5 有冲击
+    "kurt_vhi": 7.0,    # ≥7 强冲击
+    "crest_hi": 8.0,
+    "sub_hi": 0.35,     # 0.5X 幅值 ≥35% 1X → 次谐波明显
+    "brg_rel": 8.0,     # 轴承阶次峰 ≥8× 邻域中位
+    "brg_min_hz": 60.0,  # 60Hz 以下轴承阶次和轴谐波混在一起，不采信
+}
+
+# 同等置信度下的严重度排序（严重且证据足的排前面）
+FAULT_MODE_SEV = {
+    "断齿": 30, "齿崩损（局部剥落）": 25, "齿根裂纹（未断）": 20,
+    "齿轮箱轴承损伤": 18, "轴弯曲（轴系不对中）": 12, "齿轮不平衡（质量偏心）": 10,
+    "齿廓偏差/传动误差": 8, "轮齿均匀过度磨损": 6, "侧隙过大": 5,
+    "啮合面混入杂质/异物": 4, "润滑不良": 3,
+}
+
+
+def _amp_near(f, amp, hz, tol_hz=0.0):
+    """取 hz 附近 ±max(tol,1.5Hz) 内的最大幅值。"""
+    if not hz or hz <= 0 or f.size == 0:
+        return 0.0
+    tol = max(float(tol_hz), 1.5)
+    m = (f >= hz - tol) & (f <= hz + tol)
+    return float(amp[m].max()) if m.any() else 0.0
+
+
+def _local_med(f, amp, hz, width=None):
+    width = width or max(hz * 0.25, 20.0)
+    m = (f > hz - width) & (f < hz + width)
+    return float(np.median(amp[m])) if m.any() else 0.0
+
+
+def spectrum_evidence(f, amp, machine, f_rot, sig=None):
+    """把判定要用的证据一次算齐。f/amp 为当前幅值谱，machine 为机型 profile。"""
+    ev = {"ok": False, "f_rot": float(f_rot or 0.0)}
+    try:
+        f = np.asarray(f, dtype=float)
+        amp = np.asarray(amp, dtype=float)
+        if f.size < 64 or not f_rot or f_rot <= 0:
+            return ev
+        gears = (machine or {}).get("gears") or []
+        if not gears:
+            return ev
+        sh = shaft_freqs(f_rot * 60.0, machine)
+        # 1) 挑谱上最明显的一级齿轮
+        best = None
+        for g in gears[:5]:
+            base = float(sh.get(g.get("shaft"), 0.0) or 0.0)
+            if base <= 0:
+                continue
+            mesh = float(g["teeth"]) * base
+            if mesh < 12 or mesh > float(f[-1]) * 0.9:
+                continue
+            a1 = _amp_near(f, amp, mesh, max(1.0, mesh * 0.004))
+            ref = _local_med(f, amp, mesh, max(mesh * 0.3, 20.0))
+            sc = a1 / max(ref, 1e-12)
+            if best is None or sc > best[0]:
+                best = (sc, g, mesh, a1, base)
+        if best is None or best[3] <= 0:
+            return ev
+        _sc, g, mesh, h1, base = best
+        # 谐波取“净峰高”（扣掉各自邻域中位）：平坦底噪上算比值会凭空造出谐波
+        hraw = [_amp_near(f, amp, mesh * k, max(1.0, mesh * k * 0.003)) for k in (1, 2, 3, 4)]
+        hnet = []
+        for k in (1, 2, 3, 4):
+            hz = mesh * k
+            hnet.append(max(0.0, hraw[k - 1] - _local_med(f, amp, hz, max(hz * 0.2, 15.0))))
+        if hnet[0] <= 0:
+            return ev
+        h1 = hnet[0]
+        ev.update({"ok": True, "stage": g.get("name", ""), "mesh": float(mesh),
+                   "shaft_hz": float(base), "h1": float(h1)})
+        ev["h"] = hnet
+        ev["r2"], ev["r3"], ev["r4"] = (hnet[1] / h1, hnet[2] / h1, hnet[3] / h1)
+        # 3) 边带（复用齿轮判读那套候选匹配）
+        cands = []
+        for code, cn in (("H", "高速轴"), ("M", "中速轴"), ("S", "低速轴"),
+                         ("L", "行星架"), ("P", "行星轮")):
+            if sh.get(code, 0) > 0:
+                cands.append((cn + "转频", float(sh[code])))
+        n_gcd = int(g.get("gcd") or 0)
+        if n_gcd >= 2:
+            cands.append(("GMF/%d" % n_gcd, mesh / n_gcd))
+        n_pl = int(g.get("planets") or 0)
+        if n_pl >= 2:
+            cands.append(("GMF/%d" % n_pl, mesh / n_pl))
+        sb = gear_sideband_verdict(f, amp, mesh, cands)
+        ev["sb_hits"] = len(sb.get("hits") or [])
+        ev["sb_ratio"] = float(sb.get("ratio") or 0.0)
+        ev["sb_match"] = sb.get("match")
+        ev["sb_spacing"] = float(sb.get("spacing") or 0.0)
+        # 4) 转频 1X/2X、次谐波：在 H/M/S/L 里挑 1X 最突出的那根轴来算
+        #    （齿轮级所在轴未必是振动最明显的那根，比如行星级的载波轴）
+        _pick = None
+        for _code in ("H", "M", "S", "L"):
+            _f0 = float(sh.get(_code, 0.0) or 0.0)
+            if _f0 <= 0:
+                continue
+            _a1 = _amp_near(f, amp, _f0, max(1.0, _f0 * 0.02))
+            _sig1 = _a1 / max(_local_med(f, amp, _f0, max(_f0 * 0.4, 10.0)), 1e-12)
+            if _pick is None or _sig1 > _pick[0]:
+                _pick = (_sig1, _code, _f0, _a1)
+        if _pick is not None:
+            base = float(_pick[2])
+            ev["shaft_hz"] = base
+        a1x = _amp_near(f, amp, base, max(1.0, base * 0.02))
+        a2x = _amp_near(f, amp, base * 2.0, max(1.0, base * 0.03))
+        ev["a1x"], ev["a2x"] = a1x, a2x
+        a1_sig = a1x / max(_local_med(f, amp, base, max(base * 0.4, 10.0)), 1e-12)
+        ev["a1x_sig"] = float(min(a1_sig, 1e6))
+        ev["r2x_1x"] = (a2x / a1x) if (a1x > 0 and a1_sig >= 3.0) else 0.0
+        ev["a1x_rel"] = a1x / h1 if h1 > 0 else 0.0
+        sub = _amp_near(f, amp, base * 0.5, max(1.0, base * 0.03))
+        ev["sub_half"] = (sub / a1x) if (a1x > 0 and a1_sig >= 3.0) else 0.0
+        # 5) 宽带本底（高频段中位 / GMF 幅值）
+        hi = float(f[-1])
+        m = (f > hi * 0.45) & (f < hi * 0.92)
+        hf = float(np.median(amp[m])) if m.any() else 0.0
+        ev["hf_floor"] = (hf / h1) if h1 > 0 else 0.0
+        # 6) 轴承阶次（取机型 points 里引用到的轴承，看 BPFO/BPFI/BSF 峰值）
+        try:
+            names = []
+            for _kw, _lst in (machine or {}).get("points") or []:
+                names.extend(_lst)
+            # 齿轮自己的谱线位置（谐波 + 边带族）：轴承阶次撞到这里会互相冒充，跳过
+            _excl = []
+            for _k in (1, 2, 3, 4):
+                _excl.append(mesh * _k)
+                for _lbl, _sp in cands:
+                    if _sp and _sp > 0:
+                        for _m in (1, 2, 3):
+                            _excl.append(mesh * _k - _m * _sp)
+                            _excl.append(mesh * _k + _m * _sp)
+            br = 0.0
+            brf = ""
+            for nm in dict.fromkeys(names):
+                e = BEARING_LIB.get(nm)
+                if not e:
+                    continue
+                code, mult = e
+                b = float(sh.get(code, 0.0) or 0.0)
+                if b <= 0:
+                    continue
+                for k in ("BPFO", "BPFI", "BSF"):
+                    hz = float(mult.get(k) or 0) * b
+                    # 低频段（轴谐波、结构共振）与齿/轴谱线太密，加速谱上分不清轴承阶次
+                    if hz <= float(FAULT_MODE_T.get("brg_min_hz", 60.0)) or hz > hi * 0.9:
+                        continue
+                    if any(abs(hz - x) < max(2.0, 0.05 * abs(x)) for x in _excl):
+                        continue
+                    a = _amp_near(f, amp, hz, max(1.0, hz * 0.01))
+                    med = _local_med(f, amp, hz, max(hz * 0.2, 10.0))
+                    rel = max(0.0, a - med) / max(med, 1e-12)
+                    if rel > br:
+                        br, brf = rel, "%s %s %.0fHz" % (nm, k, hz)
+            ev["brg_rel"], ev["brg_freq"] = br, brf
+        except Exception:
+            ev["brg_rel"], ev["brg_freq"] = 0.0, ""
+        # 7) 时域冲击
+        if sig is not None and len(sig) > 256:
+            try:
+                from scipy.stats import kurtosis as _kurt
+                x = np.asarray(sig, dtype=float)
+                rms = float(np.sqrt(np.mean(x ** 2)))
+                ev["kurt"] = float(_kurt(x, fisher=False))
+                ev["crest"] = float(np.max(np.abs(x)) / (rms + 1e-12))
+            except Exception:
+                pass
+        return ev
+    except Exception:
+        return ev
+
+
+def _fm_rule(rules):
+    """把“条件 → 依据”写紧凑：返回 (成立几条, 总条数, 依据文字列表)。"""
+    hit = [txt for ok, txt in rules if ok]
+    return len(hit), len(rules), hit
+
+
+def fault_modes(ev, point=None):
+    """按证据给出疑似故障模式，返回 [(名称, 置信度0~1, [依据...])]，按置信度降序。
+
+    每条模式都有一个“核心证据”（rules[0]）：核心不成立一律不出结论，
+    避免“没有冲击”这种负条件把模式凑成立；其余条件按占比算置信度。
+    轴系类模式（不平衡/弯曲）只在转子类测点上出：齿轮箱壳体上的 1X 主导不能直接判不平衡。
+    """
+    if not ev.get("ok"):
+        return []
+    _pt = str(point or "")
+    is_shaft_pt = any(k in _pt for k in ("主轴承", "主轴", "发电机", "转子", "叶片"))
+    # 齿轮类（含齿轮箱轴承）只认“齿轮箱”测点：主轴承/主轴看到的 GMF 是传过去的，
+    # 在那儿判齿面故障没有物理依据（它们走轴承/转子那套判据）
+    is_gear_pt = "齿轮箱" in _pt
+    _ng = not is_gear_pt      # 齿轮类模式只在传动链测点上出（发电机测点由包络判轴承）
+    T = FAULT_MODE_T
+    h1 = ev.get("h1") or 0.0
+    r2, r3, r4 = ev.get("r2") or 0.0, ev.get("r3") or 0.0, ev.get("r4") or 0.0
+    sb_n = int(ev.get("sb_hits") or 0)
+    sb_r = float(ev.get("sb_ratio") or 0.0)
+    a1x_sig = float(ev.get("a1x_sig") or 0.0)
+    r2x = float(ev.get("r2x_1x") or 0.0)
+    a1x_rel = float(ev.get("a1x_rel") or 0.0)
+    hf = float(ev.get("hf_floor") or 0.0)
+    kurt = ev.get("kurt")
+    crest = ev.get("crest")
+    sub = float(ev.get("sub_half") or 0.0)
+    brg = float(ev.get("brg_rel") or 0.0)
+    harm_hi = sum(1 for r in (r2, r3, r4) if r >= T["harm_hi"])
+    has_impact = (kurt is not None and kurt >= T["kurt_hi"]) or \
+                 (crest is not None and crest >= T["crest_hi"])
+    strong_impact = (kurt is not None and kurt >= T["kurt_vhi"]) or \
+                    (crest is not None and crest >= T["crest_hi"] * 1.6)
+    out = []
+
+    def add(name, rules, core=0, veto=False):
+        """核心条（core）必须成立；其余按命中比例给置信度，要求过半。veto 为一票否决。"""
+        if veto or not rules[core][0]:
+            return
+        n, total, why = _fm_rule(rules)
+        if n >= max(2, int(round(total * 0.6))):
+            out.append((name, n / float(total), why))
+
+    # 不平衡/轴弯曲：单条频谱判不了（发电机的 1X 本来就主导，实测 40 条里 16 条会“命中”），
+    # 需要“同测点 1X/2X 随时间的增长”这类趋势基线。判据先留在下面，默认不自动出结论。
+    _ = (r2x, a1x_rel, a1x_sig)      # 证据仍然算好，等趋势判据接进来直接用
+    if is_shaft_pt and False:        # ← 接趋势后改成正常判定
+        add("不平衡（质量偏心）", [
+        (a1x_sig >= T["one_x_sig"] and a1x_rel >= T["one_x"],
+         "1X 明显（%.0f%% GMF，%.1f× 邻域）" % (a1x_rel * 100, a1x_sig)),
+        (r2x > 0 and r2x <= 0.5, "2X/1X=%.2f（2X 未反超）" % r2x),
+        (sb_n <= T["sb_sparse"], "边带稀疏(%d 处)" % sb_n),
+        (not has_impact, "无明显冲击"),
+    ], veto=(not is_shaft_pt or r2x >= T["two_x_hi"]))
+    add("轴弯曲（轴系不对中）", [
+        (r2x >= T["two_x_hi"], "2X/1X=%.2f（2X 突出）" % r2x),
+        (a1x_rel >= T["one_x"] * 0.5, "1X 有分量"),
+        (sb_n >= 2, "GMF 两侧有转频边带"),
+    ], veto=(not is_shaft_pt))
+    add("轮齿均匀过度磨损", [
+        (harm_hi >= 2 and r2 >= T["wear_r2"], "GMF 谐波 %d 阶同时抬升" % harm_hi),
+        (r2 >= T["harm_hi"], "2×GMF 达 %.0f%%" % (r2 * 100)),
+        (sb_n <= T["sb_sparse"] + 1, "边带不繁茂(%d 处)" % sb_n),
+        (not strong_impact, "无强冲击"),
+    ], veto=_ng)
+    add("齿廓偏差/传动误差", [
+        (harm_hi >= 1, "谐波抬升 %d 阶" % harm_hi),
+        (2 <= sb_n <= T["sb_dense"], "边带中等(%d 处)" % sb_n),
+        (bool(ev.get("sb_match")), "边带间隔≈%s" % ev.get("sb_match")),
+        (sb_r >= 0.1, "边带/主峰 %.2f" % sb_r),
+    ], veto=_ng)
+    add("齿根裂纹（未断）", [
+        (sb_n >= T["sb_dense"] and sb_r >= 0.20, "边带簇 %d 处（%.2f× 主峰）" % (sb_n, sb_r)),
+        (r3 >= 0.10, "3×GMF 抬升"),
+        (not strong_impact, "冲击尚弱"),
+    ], veto=_ng)
+    add("齿崩损（局部剥落）", [
+        (sb_n >= T["sb_dense"], "边带很密(%d 处)" % sb_n),
+        (has_impact, "有冲击(kurt=%s)" % ("%.1f" % kurt if kurt is not None else "-")),
+        (harm_hi >= 1, "谐波抬升"),
+    ], veto=_ng)
+    add("断齿", [
+        (sb_n >= T["sb_dense"] + 1, "边带密集(%d 处)" % sb_n),
+        (strong_impact, "强冲击(kurt=%s,cf=%s)" % (
+            "%.1f" % kurt if kurt is not None else "-",
+            "%.1f" % crest if crest is not None else "-")),
+        (harm_hi >= 2, "多阶谐波放大"),
+        (a1x_rel >= T["one_x"] * 0.5, "1X 抬升"),
+    ], veto=_ng)
+    add("侧隙过大", [
+        (sub >= T["sub_hi"], "0.5X 次谐波明显"),
+        (harm_hi >= 1, "谐波增多"),
+        (sb_n >= 2, "存在转频边带"),
+    ], veto=_ng)
+    add("啮合面混入杂质/异物", [
+        (hf >= T["hf_floor"], "高频本底抬高 %.2f×GMF" % hf),
+        (not ev.get("sb_match") and sb_n >= 1, "边带无稳定间隔"),
+        (has_impact, "有随机冲击"),
+    ], veto=_ng)
+    add("润滑不良", [
+        (hf >= T["hf_floor"] * 0.8, "高频本底抬高 %.2f×GMF" % hf),
+        (sb_n <= T["sb_sparse"], "无规整边带簇"),
+        (harm_hi <= 1, "谐波仅轻微抬升"),
+        (not strong_impact, "无强冲击"),
+    ], veto=_ng)
+    add("齿轮箱轴承损伤", [
+        (brg >= T["brg_rel"], "轴承阶次 %.1f× 邻域中位（%s）" % (brg, ev.get("brg_freq", ""))),
+        (has_impact or harm_hi >= 1, "伴随调制/冲击"),
+        (sb_n >= 1 or r2 >= T["harm_hi"] * 0.8, "存在边带或谐波抬升"),
+    ], veto=_ng)
+    out.sort(key=lambda x: (-x[1], -FAULT_MODE_SEV.get(x[0], 0)))
+    return out
+
+
+
+# 齿轮级/测点→轴承映射都在 数据\机型库.json 的 gears / points 里，代码不再内置。
+GEAR_COLOR = "#d35400"          # 啮合频率
+GEAR_SB_COLOR = "#e8a06a"       # 边带：±k×该轴转频
+GEAR_GCD_COLOR = "#8e44ad"      # 边带：GMF÷齿数公约数（n 个均布齿损伤）
+GEAR_PLANET_COLOR = "#2e7d32"   # 行星级：N×太阳轮自转 / GMF÷行星轮数
 
 AUTOCORR_MAX_TAU = 0.2
 AUTOCORR_DOWNSAMPLE_FS = None  # 不降采样，用原始fs保证精度
@@ -554,10 +1271,6 @@ def design_band(fs, lowcut, highcut, order=4, sos=False):
     return butter(order, [lo / nyq, hi / nyq], btype="band", output="sos" if sos else "ba")
 
 
-def butter_bandpass(fs, lowcut, highcut, order=4):
-    """兼容旧调用：等价于 design_band(..., sos=False)。"""
-    return design_band(fs, lowcut, highcut, order=order)
-
 
 def bandpass_rms(sig, fs, f_low, f_high):
     b, a = design_band(fs, f_low, f_high)
@@ -656,6 +1369,102 @@ def decode_zip_name(name):
     return name
 
 
+def _zip_local_entries(data):
+    """扫描 zip 的本地文件头（不依赖中央目录）。
+
+    现场拷贝/下载中断的包经常只有本地头、没有结尾的中央目录（PK\\x01\\x02 / PK\\x05\\x06），
+    zipfile 会直接报“不是 zip 文件”，但 WinRAR/7-Zip 能靠本地头照样解出来。
+    这里把本地头扫出来，供 `zip_member_names` / `zip_read_member` 兜底。
+    """
+    out, pos = [], 0
+    while True:
+        i = data.find(b"PK\x03\x04", pos)
+        if i < 0:
+            break
+        try:
+            flag = struct.unpack("<H", data[i + 6:i + 8])[0]
+            method = struct.unpack("<H", data[i + 8:i + 10])[0]
+            csize = struct.unpack("<I", data[i + 18:i + 22])[0]
+            usize = struct.unpack("<I", data[i + 22:i + 26])[0]
+            nl, el = struct.unpack("<HH", data[i + 26:i + 30])
+            raw_name = data[i + 30:i + 30 + nl]
+            try:
+                name = raw_name.decode("utf-8")
+            except Exception:
+                name = raw_name.decode("gbk", "replace")
+            start = i + 30 + nl + el
+        except Exception:
+            break
+        out.append({"name": name, "method": method, "csize": csize,
+                    "usize": usize, "start": start, "flag": flag})
+        # 本地头里没有压缩长度（data descriptor）时，跳到下一个本地头继续找
+        pos = (start + csize) if csize else (start if start > pos else pos + 4)
+    return out
+
+
+def zip_health(paths):
+    """快速体检：有多少 zip 连中央目录都没有（多半是拷贝/下载中断）。
+
+    只读 zip 尾部的中央目录，不解压、不扫本地头，几十万个也很快。
+    返回 (总包数, 缺中央目录的包数)。
+    """
+    total = bad = 0
+    for p in paths or []:
+        total += 1
+        try:
+            with zipfile.ZipFile(p):
+                pass
+        except zipfile.BadZipFile:
+            bad += 1
+        except Exception:
+            pass
+    return total, bad
+
+
+def zip_member_names(path):
+    """列出 zip 里的文件名；中央目录丢失时退回扫描本地文件头。"""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            return [i.filename for i in zf.infolist() if not i.is_dir()]
+    except zipfile.BadZipFile:
+        data = open(path, "rb").read()
+        ents = _zip_local_entries(data)
+        if not ents:
+            raise                      # 连本地头都没有（空文件/不是 zip）：仍按损坏处理
+        return [e["name"] for e in ents if not e["name"].endswith("/")]
+
+
+def zip_read_member(path, name):
+    """读一个成员；中央目录丢失时靠本地头解压。解压中断（数据不完整）返回 None。"""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            return zf.read(name)
+    except zipfile.BadZipFile:
+        pass
+    data = open(path, "rb").read()
+    for e in _zip_local_entries(data):
+        if e["name"] != name:
+            continue
+        raw = data[e["start"]:e["start"] + e["csize"]] if e["csize"] else data[e["start"]:]
+        if e["method"] == 0:
+            # 不压缩存储：文件被截断时这里会短一截，不能当完整数据交出去
+            if e["csize"] and len(raw) < e["csize"]:
+                return None
+            return raw
+        d = zlib.decompressobj(-15)
+        out = b""
+        try:
+            for off in range(0, len(raw), 1 << 16):
+                out += d.decompress(raw[off:off + (1 << 16)])
+            out += d.flush()
+        except zlib.error:
+            out = out or b""
+        # eof 为 False 说明压缩流被截断：数据不完整，宁可不要
+        return out if getattr(d, "eof", False) else None
+    raise KeyError(name)
+
+
+
 def parse_vendor_name(fname, point_names):
     """识别采集软件导出的文件名：<项目>_<机组><测点><转速>_<14位时间>.csv
 
@@ -681,6 +1490,41 @@ def parse_vendor_name(fname, point_names):
     return None
 
 
+def dedupe_project_dirs(dirs):
+    """去掉“已被其它登记目录包含”的子目录。
+
+    父子目录同时登记时，同一个 CSV 会被两个库各加载一遍：表格翻倍、趋势点重叠。
+    规则：祖先优先（父目录覆盖子目录）；重复项只留第一个（调用方把当前目录放最前）。
+    """
+    out = []
+    seen = set()
+    for d in dirs or []:
+        if not d:
+            continue
+        key = os.path.normcase(os.path.normpath(d))
+        if key in seen:
+            continue
+        if any(key.startswith(s + os.sep) for s in seen):
+            continue
+        out = [x for x in out
+               if not os.path.normcase(os.path.normpath(x)).startswith(key + os.sep)]
+        seen = {os.path.normcase(os.path.normpath(x)) for x in out}
+        out.append(d)
+        seen.add(key)
+    return out
+
+
+def dedupe_rows_by_path(rows):
+    """同一 csv_path 只保留一条（重复登记目录/手工复制数据时的兜底）。"""
+    out = {}
+    for r in rows or []:
+        p = r.get("csv_path")
+        if not p:
+            continue
+        out[os.path.normcase(os.path.normpath(p))] = r
+    return list(out.values())
+
+
 def normalize_projects(rows):
     # 一个项目总目录视为同一个项目：清理项目/机组/测点名称首尾空白，
     # 并把不同写法的项目名统一到主项目（出现次数最多者），
@@ -703,16 +1547,6 @@ def normalize_projects(rows):
 def get_cache_path(csv_path): return csv_path + CACHE_SUFFIX
 
 
-def load_cache(csv_path):
-    cp = get_cache_path(csv_path)
-    if os.path.exists(cp):
-        try: return json.load(open(cp, encoding="utf-8"))
-        except: return None
-    return None
-
-
-def save_cache(csv_path, data):
-    json.dump(data, open(get_cache_path(csv_path), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
 
 # ===================== SQLite 趋势缓存（取代 trend_summary.json 与启动遍历小 JSON）=====================
@@ -734,6 +1568,14 @@ CREATE TABLE IF NOT EXISTS records(
     vdi_low_g TEXT, vdi_mid_g TEXT, vdi_hi_g TEXT, vdi_grade TEXT
 )"""
 _DDL_META = "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v)"
+# 已判定“算不出来”的文件（量级异常/点数不足/测点不在规则里…）：
+# 记下 mtime+size，文件没变就不再重算；否则每次扫描都会白跑一遍又白扔一遍
+_DDL_REJECTED = """
+CREATE TABLE IF NOT EXISTS rejected(
+    csv_path TEXT PRIMARY KEY,
+    mtime    REAL, size REAL,
+    reason   TEXT, ts REAL
+)"""
 # 覆盖树分组、趋势按测点+时间、日期/转速筛选等主要访问路径
 _DDL_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_rec_point_time ON records(point, dt_ts)",
@@ -757,6 +1599,7 @@ def db_connect(main_dir):
     conn.execute("PRAGMA cache_size=-65536")  # 64MB 页缓存，加速批量写入与全量读取
     conn.execute(_DDL_RECORDS)
     conn.execute(_DDL_META)
+    conn.execute(_DDL_REJECTED)
     conn.commit()
     _ensure_schema(conn)
     for _ddl in _DDL_INDEXES:
@@ -858,14 +1701,6 @@ def db_delete_paths(conn, paths):
         conn.executemany("DELETE FROM records WHERE csv_path=?", [(p,) for p in paths])
 
 
-def db_replace_all(conn, rows):
-    """全量替换：清空旧记录后批量写入（同时清除已删 CSV 的孤儿记录与旧版本数据），单事务。"""
-    sql = _records_insert_sql()
-    data = [_coerce_row(r) for r in rows]
-    with conn:
-        conn.execute("DELETE FROM records")
-        conn.executemany(sql, data)
-
 
 def db_load_all(conn):
     """一次性读出全部记录为 list[dict]；dt_date 由文本转为 date 对象，与历史缓存主路径一致。"""
@@ -883,6 +1718,179 @@ def db_load_all(conn):
     return out
 
 
+def db_load_rejected(conn):
+    """{normcase(路径): (mtime, size, reason)} —— 已判定算不出来的文件，下次直接跳过。"""
+    out = {}
+    try:
+        for r in conn.execute("SELECT csv_path, mtime, size, reason FROM rejected"):
+            out[os.path.normcase(str(r[0]))] = (float(r[1] or 0), float(r[2] or 0), str(r[3] or ""))
+    except Exception:
+        pass
+    return out
+
+
+def db_save_rejected(conn, items):
+    """items: [(path, mtime, size, reason)]；同路径覆盖。"""
+    if not items:
+        return
+    try:
+        with conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO rejected(csv_path, mtime, size, reason, ts) VALUES(?,?,?,?,?)",
+                [(p, float(m), float(s), str(r), time.time()) for p, m, s, r in items])
+    except Exception:
+        pass
+
+
+def db_delete_rejected(conn, paths):
+    if not paths:
+        return
+    try:
+        with conn:
+            conn.executemany("DELETE FROM rejected WHERE csv_path=?",
+                             [(p,) for p in paths])
+    except Exception:
+        pass
+
+
+# 这些原因属于“文件本身如此”，可以缓存拒收结论（读失败/未知错误不缓存，下次重试）
+_REJECT_CACHEABLE = ("采样点数不足", "量级异常", "不在规则列表", "测点名为空",
+                     "未解析到fs", "没有可用数值")
+
+
+def reject_cacheable(reason):
+    """该失败原因是否值得记进 rejected 表（避免每次扫描重复计算）。"""
+    txt = reason or ""
+    return any(k in txt for k in _REJECT_CACHEABLE)
+
+
+# 采样点数/时长下限：低于这个值，频谱分辨率与包络判据都不可信，加载时要弹窗说明
+MIN_POINTS = 1024          # 点数硬下限（再少 rfft 出来的谱线稀疏到没法判读）
+MIN_SECONDS = 0.5          # 时长下限（与 process_one_csv 的 fs×0.5 口径一致）
+
+
+def data_health_warnings(n, fs, point, meta=None):
+    """加载前的数据体检，返回提示文本列表（空表示没问题）。
+
+    覆盖三类坑：点数/时长不足、多列 CSV（已自动取数值列，但要告诉用户取的是哪列）、
+    采样率与分析频带不匹配（带内 RMS 上限固定 fs/2.56，超了就只剩部分谱线）。
+    """
+    out = []
+    n = int(n or 0)
+    fs = float(fs or 0)
+    dur = (n / fs) if fs > 0 else 0.0
+    if n < MIN_POINTS or (0 < dur < MIN_SECONDS):
+        out.append("采样点数不足：%d 点（%.2f s @ %g Hz），最低要求 %d 点且 ≥ %.1f s。\n"
+                   "频谱分辨率会变粗，包络谱/齿轮判据会失真。"
+                   % (n, dur, fs, MIN_POINTS, MIN_SECONDS))
+    if meta and meta.get("multi"):
+        out.append("检测到多列 CSV（%d 列），已取第 %d 列数值（其它列忽略）。"
+                   % (int(meta.get("ncols") or 0), int(meta.get("col") or 0) + 1))
+    if fs > 0:
+        band = rms_band_for(point)
+        if not band:
+            band = default_bp.get(point)
+        if not band:
+            _rd = rule_dict.get(point) or {}
+            if _rd.get("f_high"):
+                band = (_rd.get("f_low", 0), _rd.get("f_high"))
+        if band:
+            b_lo, b_hi = float(band[0]), float(band[1])
+            eff = fs / 2.56
+            if eff <= b_lo:
+                out.append("采样率过低：fs/2.56 = %.1f Hz，比该测点分析频带下限 %.0f Hz 还低，"
+                           "带内 RMS 基本取不到谱线，结果不可信。" % (eff, b_lo))
+            elif b_hi > eff * 1.02:
+                out.append("采样率偏低：该测点分析频带 %.0f–%.0f Hz，但 fs/2.56 只有 %.1f Hz，"
+                           "带内 RMS 实际只统计到 %.1f Hz。" % (b_lo, b_hi, eff, eff))
+    return out
+
+
+def _detect_csv_layout(path):
+    """看前几行判断：分隔符 / 列数 / 有没有表头。返回 (delim, ncols, has_header)。"""
+    lines = []
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as fp:
+            for _ in range(6):
+                ln = fp.readline()
+                if not ln:
+                    break
+                lines.append(ln.rstrip("\r\n"))
+    except Exception:
+        return None, 1, False
+    cand = None
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        for d in (",", "\t", ";", "|"):
+            if d in s:
+                cand = d
+                break
+        if cand is None and len(s.split()) >= 2:
+            cand = " "
+        break        # 第一行非空行就代表格式，别再看后面
+    if not cand:
+        return None, 1, False
+    sep = r"\s+" if cand == " " else cand
+    ncols = len([x for x in re.split(sep, lines[0].strip()) if x != ""])
+    has_header = False
+    try:
+        float(re.split(sep, lines[0].strip())[0])
+    except Exception:
+        has_header = True
+    return sep, max(1, ncols), has_header
+
+
+def read_signal_csv(path, nrows=None):
+    """读振动信号，返回 (数值数组, 元信息)。
+
+    采集器导出的是单列纯数字；用户也可能丢进“时间,幅值”两列、带表头、Tab 分隔的 CSV。
+    以前一律 `iloc[:,0]`：空格分隔的多列会被 pandas 当成一列字符串 → 全 NaN → 0 点，
+    提示还写成“采样点数不足”。这里先探格式，多列时挑数值最多的那一列。
+    """
+    meta = {"multi": False, "col": 0, "ncols": 1, "header": False}
+    sep, ncols, has_header = _detect_csv_layout(path)
+    kwargs = {"header": 0 if has_header else None}
+    if nrows:
+        kwargs["nrows"] = int(nrows)
+    if sep:
+        kwargs.update({"sep": sep, "engine": "python"})
+    try:
+        df = pd.read_csv(path, **kwargs)
+    except Exception:
+        df = pd.read_csv(path, header=None, nrows=nrows)
+    df = df.apply(pd.to_numeric, errors="coerce")
+    if df.shape[1] <= 1:
+        vals = df.iloc[:, 0].dropna().values.astype(float) if df.shape[1] else np.array([])
+        meta["header"] = bool(has_header)
+        return vals, meta
+    best_col, best_n = 0, -1
+    for i in range(min(df.shape[1], 8)):
+        n = int(df.iloc[:, i].notna().sum())
+        if n > best_n:
+            best_col, best_n = i, n
+    # 第一列若是等间隔递增的时间轴（“时间,幅值”格式），不能拿它当振动信号
+    try:
+        _c0 = df.iloc[:, 0].dropna().values.astype(float)
+        if best_col == 0 and _c0.size > 10:
+            _d0 = np.diff(_c0)
+            _step = float(_d0.mean()) if _d0.size else 0.0
+            # 等间隔递增（允许 %.6f 舍入带来的抖动）→ 判定为时间轴
+            if _step > 0 and np.all(_d0 > 0) and float(_d0.std()) <= 0.1 * _step:
+                _cand = [i for i in range(1, min(df.shape[1], 8))
+                         if df.iloc[:, i].notna().any()]
+                if _cand:
+                    best_col = max(_cand, key=lambda i: float(
+                        np.std(df.iloc[:, i].dropna().values.astype(float))))
+                    meta["time_col"] = 0
+    except Exception:
+        pass
+    meta.update({"multi": True, "col": best_col, "ncols": int(df.shape[1]),
+                 "header": bool(has_header)})
+    return df.iloc[:, best_col].dropna().values.astype(float), meta
+
+
 def process_one_csv(csv_path):
     try:
         fn = os.path.basename(csv_path); info = parse_filename(fn); point = info["point"]
@@ -891,11 +1899,14 @@ def process_one_csv(csv_path):
         rule = rule_dict[point]; fs = info["fs"]
         if fs is None: return None, f"未解析到fs: {fn}"
         try:
-            sig = pd.read_csv(csv_path, header=None).iloc[:, 0]
-            sig = pd.to_numeric(sig, errors="coerce").dropna().values.astype(float)
+            sig, _meta = read_signal_csv(csv_path)
         except Exception as e:
             return None, f"读csv失败: {e}"
-        if len(sig) < fs * 0.5: return None, f"数据点太少({len(sig)})"
+        if len(sig) == 0:
+            return None, "CSV 里没有可用数值（需要单列数值，或含数值列的多列文件）"
+        if len(sig) < fs * 0.5:
+            return None, ("采样点数不足：%d 点（%.2f s @ %g Hz），至少需要 %.0f 点（0.5 s）"
+                          % (len(sig), len(sig) / float(fs), fs, fs * 0.5))
         # RMS 口径：按测点名称落到 0.1-10 / 10-1000 / 10-5000 Hz 三个频带之一；
         # 不在映射内的测点回退到规则表带通。带内 RMS 用一次 FFT 求，和 VDI 分频段值完全同口径。
         rms_lo, rms_hi = rms_band_for(point) or (float(rule["f_low"]), float(rule["f_high"]))
@@ -904,6 +1915,11 @@ def process_one_csv(csv_path):
             rms = bandpass_rms(sig, fs, rms_lo, rms_hi)
         rms = float(rms)
         peak = float(np.max(np.abs(sig)))
+        # 量级不合理的数据（传感器饱和/单位不对）不入库：否则峰值、RMS、趋势、报警全被带偏。
+        # 阈值见 ABNORMAL_PEAK / ABNORMAL_RMS。
+        if peak >= ABNORMAL_PEAK or rms >= ABNORMAL_RMS:
+            return None, ("量级异常：峰值 %.1f m/s²、带内 RMS %.2f m/s²"
+                          "（疑似传感器饱和或单位不对，需现场核实），已跳过" % (peak, rms))
         sig_c = sig - np.mean(sig)
         var = float(np.mean(sig_c ** 2))
         _pk_c = float(np.max(np.abs(sig_c)))
@@ -1339,7 +2355,47 @@ class ToolTip:
         self.win = None
 
 
+class _ChartTitleProxy:
+    """把原来的单 Label 标题代理成两行 Label（便于控制字号/1.5 倍行距）。
+
+    旧代码里所有 self.chart_title.config(text=..., style=...) 调用都还能用：
+    text 按换行拆成两行，style 同时套到两个 Label 上。
+    """
+
+    def __init__(self, l1, l2, frame=None):
+        self._l1 = l1
+        self._l2 = l2
+        self._frame = frame
+
+    def config(self, **kw):
+        if "text" in kw:
+            t = str(kw.get("text") or "")
+            parts = t.split(chr(10))
+            try:
+                self._l1.config(text=parts[0])
+                self._l2.config(text=parts[1] if len(parts) > 1 else "")
+            except Exception:
+                pass
+        if "style" in kw:
+            dark = "Dark" in str(kw["style"])
+            if self._frame is not None:
+                try:
+                    self._frame.configure(bg=CHART_BG if dark else UI_BG)
+                except Exception:
+                    pass
+            for w in (self._l1, self._l2):
+                try:
+                    w.configure(style=kw["style"])
+                except Exception:
+                    pass
+
+    configure = config
+
+
 class SpectrumWindow(tk.Toplevel):
+    # 数据体检下限沿用模块级常量（见 MIN_POINTS / data_health_warnings）
+    MIN_POINTS = MIN_POINTS
+    MIN_SECONDS = MIN_SECONDS
     # 多个基频的配色：每个基频及其倍频/边带/带宽共用一种颜色
     BASE_COLORS = ["#c62828", "#6a1b9a", "#00695c", "#ad1457",
                    "#4e342e", "#283593", "#827717", "#e65100"]
@@ -1365,13 +2421,29 @@ class SpectrumWindow(tk.Toplevel):
         self.single_line_on = False
         self._single_start_t = None
         self._freq_confirmed = False
-        self._manual_marks_time = []  # 手动标注的时间点
+        self.fcdiff_on = False
+        self._fc_t = []
+        # 时间游标（时域双游标）：点两次定 A/B，方向键按 1 个采样点微调、Shift+方向找峰（跳 10 个峰）
+        self.tcursor_on = False
+        self._tc_t = []
+        self.fcdiff_on = False
+        self._fc_t = []          # 频差：[f_A] 或 [f_A, f_B]
+        self._fc_active = 0
+        # 时间游标：[t_A] 或 [t_A, t_B]
+        self._tc_active = 0      # 键盘移动哪一条
+        self._manual_marks_time = []
+        self.fcdiff_on = False
+        self._fc_t = []
+        self._fc_active = 0  # 手动标注的时间点
         self.manual_marks = []   # [(x_val, label), ...]
         self.annotate_mode = False
         self.active_mark_x = None  # 活动基频线当前x位置
         self.show_peaks = True  # 自动峰值标注开关
         self._undo_stack = []  # 撤销栈
         self._xmax_override = None  # 倍频后强制扩展的x轴右边界
+        self._zoom_full_override = None
+        self._zoom_full_override = None  # 自相关 5 周期视图下，缩小按钮的“完整视图”
+        self._zoom_hi = None             # 缩小到“最高分析频率”后，谱图保持扩展视图
         self._harmonics_text = None   # 倍频信息文本
         self._sidebands_text = None   # 边带信息文本
         self._bandwidth_text = None   # 带宽信息文本
@@ -1380,8 +2452,9 @@ class SpectrumWindow(tk.Toplevel):
         self._sideband_params = {}    # {基频: 边带间隔}
         self._active_f0_color = self.BASE_COLORS[0]
         self._cur_f = None; self._cur_amp = None  # 当前谱图数据，用于方向键找峰
-        # 标注整体显示/隐藏（隐藏不删除状态，可恢复）
-        self.marks_hidden = False
+        # 标注整体显示/隐藏（隐藏不删除状态，可恢复）：**按谱图分别记**，
+        # 在时域隐藏了标注，切到 FFT 仍然是显示状态
+        self._hidden_plots = {}
         # 视图锁定：冻结当前 X/Y 轴范围并关闭鼠标点击/拖拽改标记的交互，
         # 用于自相关等场景下“找准周期后不让误点击把它改掉”
         self.axis_locked = False
@@ -1405,9 +2478,13 @@ class SpectrumWindow(tk.Toplevel):
         self._rot_hz = None          # 手动设置的转频(1X, Hz)；None 表示按文件名转速
         self._bearing_marks = []     # 轴承特征频率标注：[{hz,label,color}]
         self._bearing_sel = None     # 上次选的轴承名
-        self._gear_marks = []        # 齿轮啮合/边带标注：[{hz,label,color,lw}]
+        self._machine_name = None    # 手选机型（None=按项目名自动匹配，见 current_machine）
+        self._machine_proj = None    # 上次文件的项目名，换项目时把手选机型清掉
+        self._gear_marks = []        # 齿轮频率标注：[{hz,label,color,lw}]
         self._gear_stage = 2         # 上次选的齿轮级（默认三级=中速轴）
-        self._auto_bearing_on = True   # 按项目+测点自动标注轴承特征频率（府谷库）
+        # 按“项目+测点”自动标注轴承特征频率：默认关闭；右键「轴承特征频率…」里的
+        # “自动”勾选框控制（勾上按测点匹配，取消则手选轴承）
+        self._auto_bearing_on = False
         self._auto_bearing_used = False
         self._fft_ref_cache = None   # 全记录幅值谱缓存：把瀑布等低分辨率谱图上的峰细化到 fs/N
         self._fft_ref_key = None
@@ -1449,12 +2526,19 @@ class SpectrumWindow(tk.Toplevel):
         self.var_stft_win = tk.BooleanVar(value=True)
 
         # 图谱标题独立条带（画布外），不与悬浮图标争用同一区域，窗口缩小时也不会互相遮挡
-        self.chart_title = ttk.Label(self, style="ChartTitle.TLabel", justify="center",
-                                     anchor="center", font=(UI_FONT_FAMILY, 10))
-        self.chart_title.pack(fill="x", padx=8, pady=(6, 0))
+        _tb = tk.Frame(self, bg=UI_BG)
+        self.title_l1 = ttk.Label(_tb, text="", style="ChartTitle.TLabel", justify="center",
+                                  anchor="center", font=(UI_FONT_FAMILY, 11, "bold"))
+        self.title_l2 = ttk.Label(_tb, text="", style="ChartTitle.TLabel", justify="center",
+                                  anchor="center", font=(UI_FONT_FAMILY, 11))
+        self.title_l1.pack(fill="x")
+        self.title_l2.pack(fill="x", pady=(7, 0))    # 约 1.5 倍行距
+        _tb.pack(fill="x", padx=8, pady=(8, 0))      # 第一行上方也留 1.5 倍行距
+        self.chart_title = _ChartTitleProxy(self.title_l1, self.title_l2, _tb)
         # 画布承载容器：左/右两个角的悬浮工具条 place 在它之上
         self.plot_holder = ttk.Frame(self)
-        self.plot_holder.pack(fill="both", expand=True, padx=5, pady=(2, 5))
+        self.plot_holder.pack(fill="both", expand=True, padx=5, pady=(0, 2))
+        # 标题紧贴画布上方（不额外留白），快捷键截图时和谱图一起入画
         # figure 外围（顶部图标留白带）用与标题条一致的浅色 UI_BG，深灰仅用于 axes 绘图面。
         # dpi 基准用 96：matplotlib 的 Tk 后端会按 tk scaling 再乘设备像素比（125% 时 ×1.25），
         # 最终 figure.dpi 正好等于屏幕 DPI，图上的字号与界面一致（不要在这里再乘一次缩放）
@@ -1466,10 +2550,7 @@ class SpectrumWindow(tk.Toplevel):
         self.canvas.mpl_connect("button_press_event", self._on_click_annotate)
         self.canvas.mpl_connect("pick_event", self._on_pick_panel)
         self.canvas.mpl_connect("button_press_event", self._onclick_mark_time)
-        self.canvas.mpl_connect("button_press_event", self._onclick_single_line)
-        self.canvas.mpl_connect("button_press_event", self._on_press_period)
-        self.canvas.mpl_connect("motion_notify_event", self._on_motion_period)
-        self.canvas.mpl_connect("button_release_event", self._on_release_period)
+        # 时域「鼠标标注频率」已取消（基频起点/拖拽调整），周期改由时间游标 A/B 给出
         self.canvas.mpl_connect("button_press_event", self._on_canvas_context)
         self.canvas.mpl_connect("key_press_event", self._on_key_press)
         self.canvas.mpl_connect("scroll_event", self._on_spectrum_scroll)
@@ -1498,13 +2579,14 @@ class SpectrumWindow(tk.Toplevel):
         self._icon(self.flow_right, "\u27f2", "还原原图", self._reset_view,
                    btn_style="IconFlat.TButton", padx=4)
 
-        # 左上角悬浮工具条：基频/频率(时域) + 基频/倍频/边带/带宽/峰值（按谱类型显隐）
+        # 左上角悬浮工具条：时间游标(时域) + 基频/倍频/边带/带宽/峰值（按谱类型显隐）
         self.flow_left = ttk.Frame(self.plot_holder, style="ChartTool.TFrame")
-        # 时域专用：基频标注（与谱图“基频”同一图标）、频率（仅时域显示，排在最前）
-        self.btn_single = self._fund_button(self.flow_left, self._toggle_single_line,
-                                            tip="基频标注（在时域图上选起点）", toggle=True)
-        self.btn_freq = self._icon(self.flow_left, "Hz", "频率（设置基频频率，单位 Hz）",
-                                   self._popup_freq, btn_style="IconFlat.TButton", padx=4)
+        # 时域专用：时间游标（点两次定 A/B 两条，方向键 1ms 微调，Shift+方向在波形峰之间跳）
+        self.btn_tcursor = self._icon(
+            self.flow_left, "\u2016",
+            "时间游标",
+            self._toggle_time_cursor, toggle=True,
+            btn_style="IconFlat.TButton", padx=4)
         self.btn_annotate = self._fund_button(self.flow_left, self._toggle_annotate, tip="基频")
         self.btn_harm = self._icon(self.flow_left, "\u00d7n", "倍频标注", self._draw_harmonics,
                                    btn_style="IconFlat.TButton", padx=4)
@@ -1512,12 +2594,24 @@ class SpectrumWindow(tk.Toplevel):
                                    btn_style="IconFlat.TButton", padx=4)
         self.btn_bw = self._icon(self.flow_left, "\u2194", "带宽标注", self._draw_bandwidth,
                                  btn_style="IconFlat.TButton", padx=4)
+        self.btn_fcdiff = self._icon(self.flow_left, "Δf",
+                                     "频差（点两次取 A/B 两条谱线，标出频率差；Esc 清除）",
+                                     self._toggle_fcdiff, toggle=True,
+                                     btn_style="IconFlat.TButton", padx=4)
         self.btn_peak = self._icon(self.flow_left, "\u25b2", "峰值自动标注", self._toggle_peak,
                                    toggle=True, btn_style="IconFlat.TButton", padx=4)
+        # 左侧图标按钮压窄（默认样式太宽，6 个按钮会挤到右侧工具条）
+        for _b in (self.btn_tcursor, self.btn_annotate, self.btn_harm, self.btn_side,
+                   self.btn_bw, self.btn_fcdiff, self.btn_peak):
+            try:
+                _b.configure(width=3)
+            except Exception:
+                pass
         # 悬浮按钮初始开关视觉态：峰值标注默认开启，其余默认关闭
         self._set_on(self.btn_refine, False)
         self._set_on(self.btn_annotate, False)
         self._set_on(self.btn_peak, self.show_peaks)
+        self._set_on(self.btn_fcdiff, False)
 
         if auto_load:
             self._pending_auto_load = auto_load
@@ -1550,9 +2644,9 @@ class SpectrumWindow(tk.Toplevel):
     def _destroy_selector(self):
         if self.rs is not None:
             try: self.rs.set_active(False)
-            except: pass
+            except Exception: pass
             try: self.rs.clear()
-            except: pass
+            except Exception: pass
             self.rs = None
 
     def _push_undo(self):
@@ -1565,11 +2659,15 @@ class SpectrumWindow(tk.Toplevel):
             "_sidebands_text": self._sidebands_text,
             "_bandwidth_text": self._bandwidth_text,
             "_bandwidth_regions": list(self._bandwidth_regions),
+            "_tc_t": list(getattr(self, "_tc_t", [])),
+            "_tc_active": int(getattr(self, "_tc_active", 0) or 0),
             "_single_start_t": self._single_start_t,
             "_freq_confirmed": self._freq_confirmed,
             "_base_colors": dict(getattr(self, "_base_colors", {})),
             "_sideband_params": dict(getattr(self, "_sideband_params", {})),
             "_manual_marks_time": list(getattr(self, "_manual_marks_time", [])),
+            "_fc_t": list(getattr(self, "_fc_t", [])),
+            "fcdiff_on": bool(getattr(self, "fcdiff_on", False)),
         })
         if len(self._undo_stack) > 20: self._undo_stack.pop(0)
 
@@ -1586,28 +2684,51 @@ class SpectrumWindow(tk.Toplevel):
         self._sidebands_text = s["_sidebands_text"]
         self._bandwidth_text = s["_bandwidth_text"]
         self._bandwidth_regions = s["_bandwidth_regions"]
+        self._tc_t = list(s.get("_tc_t", []))
+        self._tc_active = int(s.get("_tc_active", 0) or 0)
         self._single_start_t = s.get("_single_start_t")
         self._freq_confirmed = s.get("_freq_confirmed", False)
         self._base_colors = dict(s.get("_base_colors", {}))
         self._sideband_params = dict(s.get("_sideband_params", {}))
         self._manual_marks_time = list(s.get("_manual_marks_time", []))
+        self._fc_t = list(s.get("_fc_t", []))
+        self.fcdiff_on = bool(s.get("fcdiff_on", False))
+        try:
+            self._set_on(self.btn_fcdiff, self.fcdiff_on)
+        except Exception:
+            pass
         self._redraw_current_plot()
         if was_locked: self._set_locked(True)
 
+    def _zoom_bounds(self):
+        """当前谱图“完整视图”的横轴范围（缩小/滚轮缩放的边界）。
+
+        以 _post_draw 在“无细化”时记下的 _full_xlim 为准：频谱只显示 0~fs/2.56，
+        若按原始数据的上限（Nyquist）封顶，会缩到 12800Hz 这类空区，谱被挤成左边一小条。
+        """
+        # 频域谱图：完整视图按“数据的最大分析频率”算，而不是带通设置限定的显示范围，
+        # 这样「缩小」可以把最高分析频率从带通上限一路扩到 fs/2.56
+        if self.current_plot in ("fft", "velocity", "envelope", "order", "cepstrum"):
+            fdata = self._cur_f
+            if fdata is not None and len(fdata) > 1:
+                return float(fdata[0]), float(fdata[-1])
+        full = getattr(self, "_full_xlim", None)
+        if self.current_plot == "time":
+            # 自相关 5 周期自动缩放：完整视图仍按整段记录算
+            ov = getattr(self, "_zoom_full_override", None)
+            if ov and len(ov) == 2 and float(ov[1]) > float(ov[0]):
+                return float(ov[0]), float(ov[1])
+        if full and full[0] == self.current_plot and len(full[1]) == 2:
+            return float(full[1][0]), float(full[1][1])
+        if self.current_plot == "time" and self.sig is not None and len(self.sig) > 1:
+            return 0.0, (len(self.sig) - 1) / float(self.fs)
+        f = self._cur_f
+        if f is not None and len(f) > 1:
+            return float(f[0]), float(f[-1])
+        return 0.0, float(self.fs) / 2.56
+
     def _zoom_out(self):
         if self._wf3d_active():
-            return
-        # 已经细化/缩放过：再点“缩小”= 取消细化状态，回到全图
-        if self.refine_range is not None:
-            self.refine_range = None
-            self._refine_saved.pop(self.current_plot, None)
-            self._xmax_override = None
-            was_locked = self.axis_locked
-            if was_locked:
-                self._set_locked(False)
-            self._redraw_current_plot()
-            if was_locked:
-                self._set_locked(True)
             return
         # 缩小是明确的看图动作：锁定态下临时解锁执行，完成后按新范围重新锁定
         was_locked = self.axis_locked
@@ -1615,21 +2736,38 @@ class SpectrumWindow(tk.Toplevel):
             self._set_locked(False)
         ax = self.fig.gca()
         x0, x1 = ax.get_xlim()
-        f_max = self._cur_f[-1] if self._cur_f is not None and len(self._cur_f) > 0 else self.fs/2.56
+        dlo, dhi = self._zoom_bounds()
+        span = max(dhi - dlo, 1e-12)
         # 已经是全图范围，不能再缩小
-        if x0 <= 0.001 and x1 >= f_max * 0.999:
+        if x0 <= dlo + span * 0.002 and x1 >= dhi - span * 0.002:
             if was_locked:
                 self._set_locked(True)
             return
-        center = (x0 + x1) / 2
-        half = (x1 - x0) / 2 * 1.5
-        new_x0 = max(0, center - half)
-        new_x1 = min(center + half, f_max)
-        # 走“显式视图范围”而不是直接 set_xlim：这样会按新范围重画（抽稀密度跟着视图变），
-        # 否则曲线还是按旧视图抽稀的，放大/缩小后看着发虚或断头
-        self._set_view_range(new_x0, new_x1)
-        self._refine_saved[self.current_plot] = self.refine_range
-        self._redraw_current_plot()
+        # 每一步在当前视图基础上放大 1.5 倍（不是一次跳回全图）
+        center = (x0 + x1) / 2.0
+        half = (x1 - x0) / 2.0 * 1.5
+        new_x0 = max(dlo, center - half)
+        new_x1 = min(dhi, center + half)
+        # 频域谱图通常从 0 起：贴左边时向左扩不动，改为只向右扩，缩小步数减半
+        if (self.current_plot in ("fft", "velocity", "envelope", "order", "cepstrum")
+                and x0 <= dlo + span * 0.002):
+            new_x0 = dlo
+            new_x1 = min(dhi, dlo + (x1 - x0) * 1.5)
+        if new_x1 - new_x0 >= span * 0.999:
+            # 最后一步覆盖全图：顺手清掉细化状态
+            self.refine_range = None
+            self._refine_saved.pop(self.current_plot, None)
+            self._xmax_override = None
+            self._zoom_full_override = None
+            if self.current_plot in ("fft", "velocity", "envelope", "order", "cepstrum"):
+                self._zoom_hi = float(dhi)
+            self._redraw_current_plot()
+        else:
+            # 走“显式视图范围”而不是直接 set_xlim：这样会按新范围重画（抽稀密度跟着视图变），
+            # 否则曲线还是按旧视图抽稀的，放大/缩小后看着发虚或断头
+            self._set_view_range(new_x0, new_x1)
+            self._refine_saved[self.current_plot] = self.refine_range
+            self._redraw_current_plot()
         if was_locked:
             self._set_locked(True)
 
@@ -1664,16 +2802,11 @@ class SpectrumWindow(tk.Toplevel):
         factor = 0.8 if event.button == "up" else 1.25
         a = anchor - (anchor - x0) * factor
         b = anchor + (x1 - anchor) * factor
-        # 限定在数据范围内，最多缩回原图
-        if self.current_plot == "time" and self.sig is not None:
-            dlo, dhi = 0.0, (len(self.sig) - 1) / float(self.fs)
-        else:
-            f = self._cur_f
-            dlo, dhi = (float(f[0]), float(f[-1])) if f is not None and len(f) > 1 else (None, None)
-        if dlo is not None:
-            pad = (dhi - dlo) * 0.02
-            a = max(dlo - pad, a)
-            b = min(dhi, b)
+        # 限定在“完整视图”范围内，最多缩回原图（与缩小按钮同一套边界）
+        dlo, dhi = self._zoom_bounds()
+        pad = (dhi - dlo) * 0.02
+        a = max(dlo - pad, a)
+        b = min(dhi, b)
         if b - a <= 0:
             return
         was_locked = self.axis_locked
@@ -1695,15 +2828,19 @@ class SpectrumWindow(tk.Toplevel):
         self.manual_marks = []
         self.active_mark_x = None
         self._xmax_override = None
+        self._zoom_full_override = None
+        self._zoom_hi = None
         self._harmonics_text = None
         self._sidebands_text = None
         self._bandwidth_text = None
         self._bandwidth_regions = []
         self._single_start_t = None
         self._freq_confirmed = False
+        # 时间游标也属于“标注”：还原原图时一并清掉，否则两条线和 5 个周期还压在图上，看着像没生效
+        self._tc_t = []
         if self.rs is not None:
             try: self.rs.clear()
-            except: pass
+            except Exception: pass
         self._redraw_current_plot()
         if was_locked: self._set_locked(True)
 
@@ -1729,45 +2866,21 @@ class SpectrumWindow(tk.Toplevel):
                 self._auto_lock_pending = True
             self._redraw_current_plot()
 
-    def _reset_overlay_marks(self):
-        # 清除基频/倍频/边带/带宽等叠加标注线与信息框。切换谱图或切换标注功能时调用，
-        # 避免上一张图（或上一种标注）的线、填充区、文字残留到另一张谱图上。
-        self.manual_marks = []
-        self.active_mark_x = None
-        self._xmax_override = None
-        self._harmonics_text = None
-        self._sidebands_text = None
-        self._bandwidth_text = None
-        self._bandwidth_regions = []
-        self._base_colors = {}
-        self._sideband_params = {}
-        self.annotate_mode = False
-        self._side_bw = None
+    @property
+    def marks_hidden(self):
+        """当前谱图的标注是否隐藏（各谱图各自独立）。"""
+        return bool(getattr(self, "_hidden_plots", {}).get(self.current_plot, False))
 
-    def _clear_marks(self):
-        # 清除标注：只关自动峰值标注，保留手动基频/倍频线
-        self.show_peaks = False
-        self._set_on(self.btn_peak, False)
-        self._redraw_current_plot()
+    @marks_hidden.setter
+    def marks_hidden(self, v):
+        if not hasattr(self, "_hidden_plots"):
+            self._hidden_plots = {}
+        self._hidden_plots[self.current_plot] = bool(v)
 
     def _toggle_marks_visible(self):
-        # 标注整体显示/隐藏：仅切换可见性，不删除任何标注状态，可再次点击恢复
+        # 标注整体显示/隐藏：仅切换可见性，不删除任何标注状态，可再次点击恢复；
+        # 只影响当前这张谱图，切图后各是各的
         self.marks_hidden = not self.marks_hidden
-        self._redraw_current_plot()
-
-    def _clear_all_marks(self):
-        # 一键清空全部标注：先入撤销栈，误删可连续撤销
-        self._push_undo()
-        self.show_peaks = False
-        self._set_on(self.btn_peak, False)
-        self._reset_overlay_marks()
-        self._set_on(self.btn_annotate, False)
-        self.single_line_on = False
-        self._set_on(self.btn_single, False)
-        self._single_start_t = None
-        self._freq_confirmed = False
-        self._manual_marks_time = []
-        self.marks_hidden = False
         self._redraw_current_plot()
 
     def _toggle_peak(self):
@@ -1926,11 +3039,6 @@ class SpectrumWindow(tk.Toplevel):
         self._bandwidth_text = None
         self._redraw_current_plot()
 
-    def _recompute_overlay_xmax(self):
-        # 不再自动把 X 轴右限拉到倍频/边带/带宽的最大频率：
-        # 始终保留完整频段，用户自己框选/Shift+滚轮决定看哪一段。
-        self._xmax_override = None
-
     def _base_list(self):
         """当前图上的所有基频（活动基频 + 历史基频标记 + 带宽所属基频），去重升序。"""
         vals = []
@@ -1975,41 +3083,6 @@ class SpectrumWindow(tk.Toplevel):
                     pass
         return False
 
-    def _add_base_at(self, x, xpx=None):
-        """右键添加基频：把 x 处设为新的活动基频，原来的活动基频自动转为历史基频标记（虚线+圆圈）。
-
-        与原来“基频定位 + 左键点击”是同一套数据结构，所以倍频/边带/带宽都能按各自的基频分别标注。
-        """
-        if x is None or self._cur_f is None or len(self._cur_f) == 0:
-            return
-        f_new = self._snap_to_peak(float(x), xpx)
-        if self.active_mark_x is not None and abs(float(self.active_mark_x) - f_new) < 1e-6:
-            self._redraw_current_plot()   # 已经就是这个基频，不重复添加
-            return
-        self._push_undo()
-        f0_colors = ["red", "blue", "green", "purple", "orange", "magenta", "brown", "teal"]
-        if self.active_mark_x is not None:
-            old = float(self.active_mark_x)
-            # 新基频取代旧基频：旧基频没标过倍频/边带/带宽就直接消失；
-            # 标过的保留成历史基频标记（否则那些标注会失去归属）
-            if self._base_has_annotations(old):
-                i0 = int(np.argmin(np.abs(self._cur_f - old)))
-                amp_val = max(float(self._cur_amp[i0]), 0.01)
-                f0_count = sum(1 for m in self.manual_marks if str(m[1]) == "f0")
-                c = getattr(self, "_active_f0_color", None) or f0_colors[f0_count % len(f0_colors)]
-                dup = any(str(mk[1]) == "f0" and abs(float(mk[0]) - old) < 1e-6
-                          for mk in self.manual_marks)
-                if not dup:
-                    self.manual_marks.append((old, "f0", c, amp_val))
-        self.active_mark_x = f_new
-        self._active_f0_color = self._color_for_base(f_new)
-        if self.current_plot == "autocorr":
-            self._sync_freq_from_tau(f_new)
-        self._harmonics_text = None
-        self._sidebands_text = None
-        self._bandwidth_text = None
-        self._redraw_current_plot()
-
     def _remove_base(self, f0):
         """右键删除基频：连同它的倍频/边带/带宽一起删掉；删的是活动基频时，把最近的历史基频提为活动。"""
         try:
@@ -2044,6 +3117,34 @@ class SpectrumWindow(tk.Toplevel):
         self._redraw_current_plot()
 
     def _on_click_annotate(self, event):
+        # 频差：谱图上点两次，吸附到最近的峰，标出 Δf
+        if (getattr(self, "fcdiff_on", False) and self.current_plot in self._DIFF_PLOTS):
+            if event.inaxes is None or event.button != 1 or event.xdata is None:
+                return
+            self._push_undo()
+            x_val = self._snap_fcdiff(float(event.xdata), getattr(event, "x", None))
+            if len(self._fc_t) >= 2:
+                self._fc_t = []
+            self._fc_t.append(x_val)
+            self._fc_active = len(self._fc_t) - 1
+            if len(self._fc_t) == 2:
+                self._finish_fcdiff()
+            self._redraw_current_plot()
+            return
+        # 时间游标：时域图上点两次定 A/B（不受“锁轴”影响——锁的只是缩放）
+        if self.current_plot == "time" and getattr(self, "tcursor_on", False):
+            if event.inaxes is None or event.button != 1 or event.xdata is None:
+                return
+            self._push_undo()
+            x_val = float(event.xdata)
+            if len(self._tc_t) < 2:
+                self._tc_t.append(x_val)
+                self._tc_active = len(self._tc_t) - 1
+                if len(self._tc_t) == 2:
+                    # A/B 都定完：自动退出取点态，鼠标不再改游标
+                    self._finish_time_cursor()
+            self._redraw_current_plot()
+            return
         # 锁定视图后，图上点击一律不再改基频标记（自相关找周期时最易误触）
         if self.axis_locked: return
         if not self.annotate_mode or event.inaxes is None: return
@@ -2150,6 +3251,56 @@ class SpectrumWindow(tk.Toplevel):
         # Ctrl+方向键不再有功能（原“逐谱线”已合并到普通方向键），按住 Ctrl 时忽略
         if mods & {"ctrl", "control"}:
             return
+        # 频差：Esc 清除两条线和读数
+        if base_key == "escape" and (getattr(self, "fcdiff_on", False) or getattr(self, "_fc_t", None)):
+            self.fcdiff_on = False
+            self._fc_t = []
+            try:
+                self._set_on(self.btn_fcdiff, False)
+            except Exception:
+                pass
+            self._redraw_current_plot()
+            return
+        # 时域：时间游标移动（方向键 1ms 微调，Shift+方向跳 10 个峰；Tab 切 A/B，Esc 清除）
+        # 取点态退出后（A/B 已定）方向键仍可微调已有游标，只是鼠标不再动它们
+        if self.current_plot == "time" and self._tc_t:
+            if base_key == "escape":
+                self._tc_t = []
+                self._redraw_current_plot()
+                return
+            if base_key == "tab" and len(self._tc_t) == 2:
+                self._tc_active = 1 - int(getattr(self, "_tc_active", 0) or 0)
+                return
+            if base_key in ("left", "right"):
+                sign = 1 if base_key == "right" else -1
+                i = int(getattr(self, "_tc_active", 0) or 0)
+                if 0 <= i < len(self._tc_t):
+                    lo = 0.0
+                    hi = (len(self.sig) - 1) / float(self.fs) if self.sig is not None else None
+                    # 普通方向键按“一个采样点”走（fs=25600 时约 0.039ms），比 1ms 更细
+                    try:
+                        _dt = 1.0 / float(self.fs) if self.fs else 1e-4
+                    except Exception:
+                        _dt = 1e-4
+                    v = float(self._tc_t[i]) + sign * (0.01 if shift else max(_dt, 1e-6))
+                    # 只有 Shift+方向才吸附波形峰（跳 10 个峰）；普通方向键只按 1 个采样点微调，
+                    # 不再自动找峰（找峰由 Shift 触发，避免轻按一下就跳过一个周期）
+                    peaks = getattr(self, "_tc_peaks", None)
+                    if shift and peaks is not None and len(peaks) > 1:
+                        n = 10 if shift else 1
+                        if sign > 0:
+                            j = int(np.searchsorted(peaks, float(self._tc_t[i]) + 1e-9)) + n - 1
+                            j = min(j, len(peaks) - 1)
+                        else:
+                            j = int(np.searchsorted(peaks, float(self._tc_t[i]) - 1e-9)) - n
+                            j = max(j, 0)
+                        v = float(peaks[j])
+                    v = max(lo, v)
+                    if hi:
+                        v = min(hi, v)
+                    self._tc_t[i] = v
+                    self._redraw_current_plot()
+                return
         # 时域：基频起点移动（普通方向 1ms，Shift+方向 10ms）
         if self.current_plot == "time" and self._single_start_t is not None:
             if base_key == "escape":
@@ -2207,7 +3358,91 @@ class SpectrumWindow(tk.Toplevel):
             self._sync_freq_from_tau(self.active_mark_x)
         self._redraw_current_plot()
 
-    def _peak_annotate(self, ax, f_m, amp_m, top_n=5, unit="Hz"):
+    def _signal_fft_peaks(self, top=24):
+        """当前信号的 FFT 主峰（频率升序）。
+
+        自相关标频时用它“定支”：自相关的局部极大可能落在两个相邻成分之间，
+        直接把 1/τ 当频率会标出 159.2Hz 这种实际不存在的分量（真峰是 164.1Hz）。
+        结果按 (信号引用, 长度, fs) 缓存，重绘/细化不重算 FFT。
+        """
+        if self.sig is None or not self.fs or len(self.sig) < 32:
+            return np.array([]), np.array([])
+        key = (id(self.sig), len(self.sig), float(self.fs))
+        cache = getattr(self, "_fft_peak_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1], cache[2]
+        x = np.asarray(self.sig, dtype=float)
+        x = x - float(x.mean())
+        n = len(x)
+        w = np.hanning(n)
+        amp = np.abs(np.fft.rfft(x * w)) * 2.0 / float(w.sum())
+        f = np.fft.rfftfreq(n, 1.0 / float(self.fs))
+        out_f = out_a = np.array([])
+        if len(amp) > 2:
+            pk, _ = find_peaks(amp)
+            if len(pk):
+                idx = np.sort(pk[np.argsort(amp[pk])[::-1][:top]])
+                out_f, out_a = f[idx], amp[idx]
+        self._fft_peak_cache = (key, out_f, out_a)
+        return out_f, out_a
+
+    def _autocorr_label_freq(self, tau0, tau_view, ac_view):
+        """自相关峰的频率标注：先用谱峰定支，再用第 k 个自相关峰细化 f=k/τ_k。
+
+        多周期只提高精度、救不了选错支，所以必须先锚定到谱峰（±4%），
+        再用 τ≈10T 处的自相关峰细化，误差从 ±1Hz 降到 ±0.1Hz。
+        """
+        if tau0 is None or tau0 <= 0:
+            return 0.0
+        f1 = 1.0 / float(tau0)
+        f_ref = f1
+        ff, fa = self._signal_fft_peaks()
+        if len(ff):
+            # ±5% 内可能有好几个谱峰（156.9 与 164.1 就挨着），取**幅值最大**的那个：
+            # 自相关局部极大常落在两个相邻成分之间，按“最近”会锚到弱的那条
+            m = np.abs(ff - f1) <= 0.05 * f1
+            if np.any(m):
+                cand_f = ff[m]; cand_a = fa[m]
+                f_ref = float(cand_f[int(np.argmax(cand_a))])
+        T = 1.0 / f_ref if f_ref > 0 else 0.0
+        if T <= 0 or len(tau_view) < 8:
+            return f_ref
+        t_end = float(tau_view[-1])
+        dt = float(tau_view[1] - tau_view[0])
+        if dt <= 0:
+            return f_ref
+        k_max = int(min(10.0, max(1.0, 0.15 / T)))
+        vals = []
+        for k in range(1, k_max + 1):
+            tgt = k * T
+            if tgt > t_end * 0.9:
+                continue
+            # 窗口必须窄：这段数据的自相关一个周期内有 4~5 个波纹，
+            # 窗口一宽就会挑到隔壁的局部极大，把 164Hz 算成 160Hz
+            m = (tau_view >= tgt - 0.12 * T) & (tau_view <= tgt + 0.12 * T)
+            if not np.any(m):
+                continue
+            seg_t = tau_view[m]; seg_a = ac_view[m]
+            j = int(np.argmax(seg_a))
+            if j <= 0 or j >= len(seg_a) - 1:
+                continue
+            y0, y1, y2 = float(seg_a[j-1]), float(seg_a[j]), float(seg_a[j+1])
+            den = y0 + y2 - 2.0 * y1
+            d = 0.5 * (y0 - y2) / den if abs(den) > 1e-12 else 0.0
+            d = max(-0.5, min(0.5, d))
+            t = float(seg_t[j]) + d * dt
+            if t <= 0:
+                continue
+            f2 = k / t
+            # 只收“还落在同一支上”的估计；单个 k 的峰位会抖，取中位数更稳
+            if abs(f2 - f_ref) <= 0.002 * f_ref:
+                vals.append(f2)
+        if vals:
+            return float(np.median(vals))
+        return f_ref
+
+    def _peak_annotate(self, ax, f_m, amp_m, top_n=5, unit="Hz", as_freq=False):
+        """峰值标注。as_freq=True 时把横轴量（倒频谱的倒频率 s）换算成频率 Hz 显示。"""
         if not self.show_peaks or self.marks_hidden: return
         xmin, xmax = ax.get_xlim()
         mask_view = (f_m >= xmin) & (f_m <= xmax)
@@ -2224,13 +3459,108 @@ class SpectrumWindow(tk.Toplevel):
             if len(chosen) >= top_n: break
         top = sorted(chosen, key=lambda i: f_view[i])
         ymin, ymax = ax.get_ylim()
-        offset = (ymax - ymin) * 0.06
+        yspan = max(ymax - ymin, 1e-12)
+        offset = yspan * 0.06
+        # 小数位按视窗跨度自适应：倒频谱横轴是 0~0.1s，固定 1 位会全变成“0.0s”
+        span = max(float(xmax) - float(xmin), 1e-12)
+        dec = int(np.clip(np.ceil(-np.log10(span)) + 2, 0, 4))
+        placed = []
+        try:
+            _axb0 = ax.get_window_extent()
+            _dpi0 = float(ax.figure.dpi or 100.0)
+            _box_w = 210.0 * _dpi0 / 96.0
+            _box_h = 34.0 * _dpi0 / 96.0
+            if self.current_plot in ("fft", "envelope", "velocity", "stft"):
+                placed.append((_axb0.x0 + 2, _axb0.y1 - _box_h,
+                               _axb0.x0 + 2 + _box_w, _axb0.y1))
+        except Exception:
+            pass
         for idx in top:
             fi = f_view[idx]; ai = amp_view[idx]
             ax.plot(fi, ai, "ro", ms=3, mfc="white", mec="red", mew=1.2)
             ha = "left" if fi < xmin + (xmax-xmin)*0.05 else "center"
-            ax.annotate(f"{fi:.1f}{unit}", xy=(fi, ai), xytext=(fi, ai+offset),
-                        fontsize=8, ha=ha, color="darkred",
+            if as_freq and fi > 0:
+                # 倒频率分辨率 Δq=1/fs（25600Hz 时约 0.000039s），在 88Hz 处相当于 ±0.3Hz，
+                # 所以 ≥20Hz 只给整数（和包络谱上的 88Hz 对得上），低频才留 1 位小数
+                fx = 1.0 / fi
+                txt = ("%.0fHz" % fx) if fx >= 20 else ("%.1fHz" % fx)
+            else:
+                # 频率一律 1 位小数：横轴跨度大时 dec 会退化成 0 位，
+                # 81.7Hz 被写成 “82Hz”，与图上基频标注（f=81.7Hz）对不上
+                if unit == "Hz":
+                    txt = "%.1fHz" % fi
+                else:
+                    txt = f"{fi:.{dec}f}{unit}"
+            # 幅值另起一行：上一行频率、下一行该频率的幅值（各谱图统一）
+            try:
+                _av = float(ai)
+                _dec_a = 2 if _av >= 1.0 else (3 if _av >= 0.01 else 4)
+                txt += "\n" + (("%." + str(_dec_a) + "f") % _av)
+            except Exception:
+                pass
+            # 标签避让：在屏幕坐标里估算每个标签的矩形，逐个找不重叠的位置。
+            # 两行标签（频率 + 幅值）先试峰上方，再逐级上移/下移/左右错开，
+            # 直到不和已放标签、也不和左上角 overall RMS 信息块重叠。
+            try:
+                _ren = ax.figure.canvas.get_renderer()
+            except Exception:
+                _ren = None
+            _fs = 8.0
+            _dpi = float(ax.figure.dpi or 100.0)
+            _lines = txt.split("\n")
+            _wpx = _hpx = 0.0
+            if _ren is not None:
+                try:
+                    from matplotlib.font_manager import FontProperties
+                    _fp = FontProperties(size=_fs)
+                    _wh = [_ren.get_text_width_height_descent(ln, _fp, False)
+                           for ln in _lines]
+                    _wpx = max(w for w, h, d in _wh)
+                    _hpx = sum(h for w, h, d in _wh)
+                except Exception:
+                    _ren = None
+            if _ren is None or _wpx <= 0 or _hpx <= 0:
+                _wpx = max(len(ln) for ln in _lines) * _fs * 0.62 * _dpi / 72.0
+                _hpx = max(1, len(_lines)) * _fs * 1.35 * _dpi / 72.0
+            _axb = ax.get_window_extent()
+            _px, _py = ax.transData.transform((fi, ai))
+            _best = None
+            for _k in range(0, 10):
+                _dy = 4.0 + _k * (_hpx + 3.0)
+                for _up in (True, False):
+                    _sdy = _dy if _up else -_dy
+                    for _dx, _ha in ((5.0, "left"), (-5.0, "right"), (0.0, "center")):
+                        if _ha == "left":
+                            _x0 = _px + _dx
+                        elif _ha == "right":
+                            _x0 = _px + _dx - _wpx
+                        else:
+                            _x0 = _px - _wpx / 2.0
+                        _y0 = (_py + _sdy) if _up else (_py + _sdy - _hpx)
+                        _rc = (_x0, _y0, _x0 + _wpx, _y0 + _hpx)
+                        if _rc[0] < _axb.x0 + 2 or _rc[2] > _axb.x1 - 2:
+                            continue
+                        if _rc[1] < _axb.y0 + 2 or _rc[3] > _axb.y1 - 2:
+                            continue
+                        if any(not (_rc[2] <= b[0] or _rc[0] >= b[2]
+                                    or _rc[3] <= b[1] or _rc[1] >= b[3])
+                               for b in placed):
+                            continue
+                        _best = (_rc, _ha, _sdy, _up)
+                        break
+                    if _best:
+                        break
+                if _best:
+                    break
+            if _best is None:
+                _rc = (_px + 5, _py + 4, _px + 5 + _wpx, _py + 4 + _hpx)
+                _best = (_rc, "left", 4.0, True)
+            placed.append(_best[0])
+            ax.annotate(txt, xy=(fi, ai),
+                        xytext=(0.0, _best[2] * 72.0 / _dpi), textcoords="offset points",
+                        fontsize=_fs, ha=_best[1], va=("bottom" if _best[3] else "top"),
+                        color="darkred",
+                        annotation_clip=False,   # 峰顶超出 ylim 时别把整条标注吞掉
                         arrowprops=dict(arrowstyle="-", color="gray", lw=0.6))
 
     def _on_select_refine(self, eclick, erelease):
@@ -2280,11 +3610,24 @@ class SpectrumWindow(tk.Toplevel):
         if self.refine_on:
             self._set_on(self.btn_refine, True)
             if self.rs is None:
-                self.rs = RectangleSelector(ax, self._on_select_refine, useblit=False, button=[1],
+                self.rs = RectangleSelector(ax, self._on_select_refine, useblit=True, button=[1],
                     minspanx=3, minspany=3, spancoords='pixels', interactive=False,
                     props=dict(edgecolor='none', facecolor='red', alpha=0.15))
             else:
                 self.rs.set_active(True); self.rs.ax = ax
+            # useblit 的框选需要一张背景图。直接让控件从当前画布缓存里抓（不触发整图重绘），
+            # 否则第一次按下鼠标时它才去 canvas.draw()，拖拽第一帧就会卡一下。
+            _bg_ok = False
+            try:
+                self.rs.update_background(None)
+                _bg_ok = True
+            except Exception:
+                _bg_ok = False
+            if not _bg_ok:
+                try:
+                    self.canvas.draw_idle()
+                except Exception:
+                    pass
         else:
             self._set_on(self.btn_refine, False)
             self.refine_range = None
@@ -2356,31 +3699,18 @@ class SpectrumWindow(tk.Toplevel):
                              command=self._toggle_wf_db)
             menu.add_separator()
         if self.current_plot in ("fft", "envelope", "velocity"):
-            menu.add_command(label="齿轮啮合/边带标注…（断齿、点蚀）",
-                             command=self._gear_dialog)
-            if self._gear_marks:
-                menu.add_command(label="清除齿轮啮合/边带标注", command=self._clear_gear_marks)
-            menu.add_separator()
-            menu.add_command(label="轴承特征频率标注…（BPFI/BPFO/BSF/FTF）",
-                             command=self._bearing_dialog)
-            menu.add_command(
-                label=("自动轴承标注（府谷库）：开 · 点击关闭"
-                       if getattr(self, "_auto_bearing_on", True)
-                       else "自动轴承标注（府谷库）：关 · 点击开启"),
-                command=self._toggle_auto_bearing)
+            # 齿轮频率只在齿轮箱测点上有意义：发电机/主轴承上看到的是传过去的 GMF，不给入口
+            if self._is_gear_point():
+                menu.add_command(label="齿轮频率…", command=self._gear_dialog)
+                if self._gear_marks:
+                    menu.add_command(label="清除齿轮频率标注", command=self._clear_gear_marks)
+                menu.add_separator()
+            menu.add_command(label="轴承特征频率…", command=self._bearing_dialog)
             if self._bearing_marks:
                 menu.add_command(label="清除轴承特征频率标注", command=self._clear_bearing_marks)
             menu.add_separator()
-        # 基频管理（同一张谱上可以同时存在多个基频）：右键在此处添加一个，或按频率逐个删除
+        # 基频管理：右键只保留“按频率删除”（添加基频统一走左上角「基频」按钮 + 左键点选）
         if self.current_plot not in ("time", "autocorr"):
-            x_now = getattr(event, "xdata", None)
-            try:
-                add_lbl = ("在此处添加基频（%.1fHz）" % float(x_now)) if x_now is not None else "在此处添加基频"
-            except Exception:
-                add_lbl = "在此处添加基频"
-            menu.add_command(
-                label=add_lbl,
-                command=lambda x=x_now, px=getattr(event, "x", None): self._add_base_at(x, px))
             sub = tk.Menu(menu, tearoff=0)
             bases = self._base_list()
             if bases:
@@ -2395,7 +3725,6 @@ class SpectrumWindow(tk.Toplevel):
             menu.add_separator()
         menu.add_command(label="隐藏标注" if not self.marks_hidden else "显示标注",
                          command=self._toggle_marks_visible)
-        menu.add_command(label="清除全部标注", command=self._clear_all_marks)
         menu.add_separator()
         menu.add_command(label="解锁视图（恢复交互）" if self.axis_locked
                          else "锁定视图（冻结 X/Y 轴）", command=self._toggle_lock)
@@ -2483,65 +3812,126 @@ class SpectrumWindow(tk.Toplevel):
     SIDEBAND_COLOR = "#7b52ab"
     BANDWIDTH_COLOR = "#0f7b7d"
 
-    def _gear_marks_for(self, stage_idx, f_hss, n_mesh=1, n_sb=1):
-        """算某级齿轮的啮合频率、谐波与 ±边带，返回标注列表。"""
+    def _gear_marks_for(self, stage_idx, f_hss, n_mesh=1, n_sb=1, spacing="both"):
+        """算某级齿轮的啮合频率、谐波与边带，返回标注列表（齿轮参数取当前机型）。
+
+        spacing 决定边带按什么间隔画（对应《齿轮啮合图谱经验》§3）：
+          "shaft" —— 只画 ±k×该轴转频（单齿/偏心类）
+          "gcd"   —— 只画 GMF÷齿数公约数 的族（n 个均布齿损伤，如公约数 3）
+          "both"  —— 两种都画（默认，靠颜色区分）
+        行星级（有 planets 字段）额外画「N×太阳轮自转」与「GMF÷行星轮数」。
+        """
+        gears = (self.current_machine()[1] or {}).get("gears") or []
         try:
-            name, shaft_k, teeth, sb_shaft = GEAR_STAGES[stage_idx]
+            g = gears[stage_idx]
         except Exception:
             return []
         f = self._bearing_shaft_freqs(f_hss)
-        base = f.get(shaft_k, 0.0)
-        f_sb = f.get(sb_shaft, base)
+        base = f.get(g.get("shaft"), 0.0)
+        f_sb = f.get(g.get("sideband") or g.get("shaft"), base)
         if base <= 0:
             return []
-        mesh = teeth * base
+        mesh = float(g["teeth"]) * base
+        n_sb = max(0, int(n_sb))
         marks = []
         for m in range(1, int(n_mesh) + 1):
             hz = mesh * m
             lab = "啮合 %.0f" % hz if m == 1 else "%d×啮合 %.0f" % (m, hz)
             marks.append({"hz": hz, "label": lab, "color": GEAR_COLOR, "lw": 1.2})
-            for k in range(1, int(n_sb) + 1):
-                for sign, tag in ((-1, "-"), (1, "+")):
-                    sb = hz + sign * k * f_sb
-                    if sb <= 0:
+            if n_sb and spacing in ("shaft", "both"):
+                for k in range(1, n_sb + 1):
+                    for sign in (-1, 1):
+                        sb = hz + sign * k * f_sb
+                        if sb <= 0:
+                            continue
+                        marks.append({"hz": sb, "label": "", "color": GEAR_SB_COLOR, "lw": 0.8})
+
+        def _add(step, color, label, cap):
+            """以 step 为间隔在 GMF 两侧画一组线（去重、限幅防止刷屏）。"""
+            if step <= 0:
+                return
+            for i in range(1, cap + 1):
+                for sign in (-1, 1):
+                    hz = mesh + sign * i * step
+                    if hz <= 0 or hz > mesh * 3:
                         continue
-                    marks.append({"hz": sb, "label": "", "color": GEAR_SB_COLOR, "lw": 0.8})
+                    if any(abs(hz - m["hz"]) < 0.05 for m in marks):
+                        continue
+                    marks.append({"hz": hz, "label": label if (i == 1 and sign < 0) else "",
+                                  "color": color, "lw": 0.8})
+
+        if n_sb and spacing in ("gcd", "both"):
+            n = int(g.get("gcd") or 0)
+            if n >= 2:
+                _add(mesh / float(n), GEAR_GCD_COLOR, "GMF/%d" % n, min(n - 1, 4))
+        n_pl = int(g.get("planets") or 0)
+        if n_pl >= 2:
+            f_sun = f.get("S", 0.0)
+            if f_sun > 0:
+                hz = n_pl * f_sun          # 太阳轮转一圈、缺陷被 n 个行星轮各打一次
+                if not any(abs(hz - m["hz"]) < 0.05 for m in marks):
+                    marks.append({"hz": hz, "label": "%d×太阳轮" % n_pl,
+                                  "color": GEAR_PLANET_COLOR, "lw": 1.2})
+            if n_sb:
+                _add(mesh / float(n_pl), GEAR_PLANET_COLOR, "GMF/%d" % n_pl, 1)
         return marks
 
     def _gear_dialog(self):
-        """选齿轮级 + 转速，标注啮合频率及其 ±转频边带（断齿/点蚀诊断）。"""
+        """选机型/齿轮级 + 转速，标注啮合频率及其 ±转频边带（断齿/点蚀诊断）。"""
         f0 = self._get_rot_hz()
         rpm0 = (f0 * 60.0) if f0 > 0 else 0.0
+        cur_name = self.current_machine()[0]
         dlg = tk.Toplevel(self)
-        dlg.title("齿轮啮合/边带标注")
+        dlg.title("齿轮频率")
         dlg.transient(self); dlg.resizable(False, False)
         frm = ttk.Frame(dlg, padding=12); frm.pack(fill="both", expand=True)
         ttk.Label(frm, text="标注齿轮啮合频率及 ±转频边带（断齿、点蚀看边带）：").grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        names = [g[0] for g in GEAR_STAGES]
-        v_g = tk.StringVar(value=names[min(self._gear_stage, len(names) - 1)])
-        ttk.Label(frm, text="齿轮级：").grid(row=1, column=0, sticky="e", pady=3)
-        ttk.Combobox(frm, textvariable=v_g, values=names, width=32,
-                     state="readonly").grid(row=1, column=1, sticky="w", pady=3)
+        # 机型：默认按项目名自动匹配；没登记的项目的可以在这里临时用别的机型参数
+        v_m = tk.StringVar(value=cur_name or AUTO_MACHINE)
+        ttk.Label(frm, text="机型：").grid(row=1, column=0, sticky="e", pady=3)
+        cb_m = ttk.Combobox(frm, textvariable=v_m, state="readonly", width=32,
+                            values=[AUTO_MACHINE] + machine_names())
+        cb_m.grid(row=1, column=1, sticky="w", pady=3)
+
+        def _gears():
+            nm = v_m.get()
+            prof = MACHINE_LIB.get(nm) if nm in MACHINE_LIB else self.current_machine()[1]
+            return (prof or {}).get("gears") or []
+
+        v_g = tk.StringVar(value="")
+        ttk.Label(frm, text="齿轮级：").grid(row=2, column=0, sticky="e", pady=3)
+        cb_g = ttk.Combobox(frm, textvariable=v_g, state="readonly", width=32)
+        cb_g.grid(row=2, column=1, sticky="w", pady=3)
+
+        def _reload_gears(_evt=None):
+            names = [g["name"] for g in _gears()]
+            cb_g["values"] = names
+            if names:
+                v_g.set(names[min(self._gear_stage, len(names) - 1)])
+            else:
+                v_g.set("")
+
+        _reload_gears()
+        cb_m.bind("<<ComboboxSelected>>", _reload_gears)
+
         v_rpm = tk.StringVar(value=("%.0f" % rpm0) if rpm0 > 0 else "")
-        ttk.Label(frm, text="高速轴转速(rpm)：").grid(row=2, column=0, sticky="e", pady=3)
-        ttk.Entry(frm, textvariable=v_rpm, width=12).grid(row=2, column=1, sticky="w", pady=3)
+        ttk.Label(frm, text="高速轴转速(rpm)：").grid(row=3, column=0, sticky="e", pady=3)
+        ttk.Entry(frm, textvariable=v_rpm, width=12).grid(row=3, column=1, sticky="w", pady=3)
         v_mesh = tk.StringVar(value="1")
-        ttk.Label(frm, text="啮合谐波次数：").grid(row=3, column=0, sticky="e", pady=3)
+        ttk.Label(frm, text="啮合谐波次数：").grid(row=4, column=0, sticky="e", pady=3)
         ttk.Combobox(frm, textvariable=v_mesh, values=["1", "2", "3"], width=5,
-                     state="readonly").grid(row=3, column=1, sticky="w", pady=3)
-        v_sb = tk.StringVar(value="1")
-        ttk.Label(frm, text="边带阶数(±k×转频)：").grid(row=4, column=0, sticky="e", pady=3)
-        ttk.Combobox(frm, textvariable=v_sb, values=["0", "1", "2", "3"], width=5,
                      state="readonly").grid(row=4, column=1, sticky="w", pady=3)
-        # 自定义倍数：库里没有的轴承（例如发电机非驱动端轴承）可直接填特征倍数
-        ttk.Label(frm, text="自定义倍数(可留空)：").grid(row=5, column=0, sticky="e", pady=3)
-        cbox = ttk.Frame(frm); cbox.grid(row=5, column=1, sticky="w", pady=3)
-        v_cust = {}
-        for _i, _k in enumerate(("BPFI", "BPFO", "BSF", "FTF")):
-            ttk.Label(cbox, text=_k).grid(row=0, column=_i * 2, padx=(0 if _i == 0 else 6, 1))
-            v_cust[_k] = tk.StringVar(value="")
-            ttk.Entry(cbox, textvariable=v_cust[_k], width=6).grid(row=0, column=_i * 2 + 1)
+        v_sb = tk.StringVar(value="1")
+        ttk.Label(frm, text="边带阶数(±k×转频)：").grid(row=5, column=0, sticky="e", pady=3)
+        ttk.Combobox(frm, textvariable=v_sb, values=["0", "1", "2", "3"], width=5,
+                     state="readonly").grid(row=5, column=1, sticky="w", pady=3)
+        # 边带依据：材料里两种间隔都出现过——轴转频（单齿/偏心）与 GMF÷齿数公约数（n 个均布齿）
+        SPACING = {"轴转频": "shaft", "GMF÷公约数": "gcd", "两者都画": "both"}
+        v_sp = tk.StringVar(value="两者都画")
+        ttk.Label(frm, text="边带依据：").grid(row=6, column=0, sticky="e", pady=3)
+        ttk.Combobox(frm, textvariable=v_sp, values=list(SPACING), width=12,
+                     state="readonly").grid(row=6, column=1, sticky="w", pady=3)
         res = {"ok": False}
 
         def ok():
@@ -2551,18 +3941,28 @@ class SpectrumWindow(tk.Toplevel):
                 messagebox.showerror("输入错误", "转速请填数字。", parent=dlg); return
             if rpm <= 0:
                 messagebox.showerror("输入错误", "转速必须大于 0。", parent=dlg); return
-            idx = names.index(v_g.get())
+            gears = _gears()
+            names = [g["name"] for g in gears]
+            if not names:
+                messagebox.showerror(
+                    "没有齿轮参数",
+                    "该机型没有登记齿轮级。\n请在 数据\\机型库.json 里补 gears 后重开。",
+                    parent=dlg)
+                return
+            idx = names.index(v_g.get()) if v_g.get() in names else 0
             marks = self._gear_marks_for(idx, rpm / 60.0,
-                                         int(v_mesh.get() or 1), int(v_sb.get() or 0))
+                                         int(v_mesh.get() or 1), int(v_sb.get() or 0),
+                                         spacing=SPACING.get(v_sp.get(), "both"))
             if not marks:
                 messagebox.showerror("计算失败", "无法计算，请检查转速。", parent=dlg); return
+            self._machine_name = v_m.get() if v_m.get() in MACHINE_LIB else None
             self._gear_marks = marks
             self._gear_stage = idx
             self._rot_hz = rpm / 60.0
             res["ok"] = True
             dlg.destroy()
 
-        bf = ttk.Frame(frm); bf.grid(row=5, column=0, columnspan=2, pady=(10, 0), sticky="e")
+        bf = ttk.Frame(frm); bf.grid(row=7, column=0, columnspan=2, pady=(10, 0), sticky="e")
         ttk.Button(bf, text="确定", command=ok).pack(side="left", padx=4)
         ttk.Button(bf, text="取消", command=dlg.destroy).pack(side="left", padx=4)
         dlg.bind("<Return>", lambda e: ok())
@@ -2576,12 +3976,120 @@ class SpectrumWindow(tk.Toplevel):
         self._gear_marks = []
         self._redraw_current_plot()
 
+    def _gear_diag_block(self):
+        """齿轮判读卡：用当前谱线实测边带，指认「哪根轴 / 哪类损伤」。
+
+        结论只给“对上/没对上”，不替用户下最终结论。
+        """
+        if not self._gear_marks or self._cur_f is None or self._cur_amp is None:
+            return None
+        if self.current_plot not in ("fft", "envelope", "velocity"):
+            return None
+        mesh = None
+        for mk in self._gear_marks:
+            if str(mk.get("label", "")).startswith("啮合"):
+                mesh = float(mk["hz"])
+                break
+        if not mesh or mesh <= 0:
+            return None
+        gears = (self.current_machine()[1] or {}).get("gears") or []
+        if not gears:
+            return None
+        idx = min(max(int(getattr(self, "_gear_stage", 0) or 0), 0), len(gears) - 1)
+        g = gears[idx]
+        try:
+            f_hss = float(self._rot_hz or 0.0)
+            if f_hss <= 0:
+                f_hss = float((self.info or {}).get("speed") or 0) / 60.0
+            sf = self._bearing_shaft_freqs(f_hss) if f_hss > 0 else {}
+        except Exception:
+            sf = {}
+        cands = []
+        for code, cn in (("H", "高速轴"), ("M", "中速轴"), ("S", "低速轴"),
+                         ("L", "行星架"), ("P", "行星轮")):
+            if sf.get(code, 0) > 0:
+                cands.append((cn + "转频", float(sf[code])))
+        n = int(g.get("gcd") or 0)
+        if n >= 2:
+            cands.append(("GMF/%d" % n, mesh / n))
+        npl = int(g.get("planets") or 0)
+        if npl >= 2:
+            cands.append(("GMF/%d" % npl, mesh / npl))
+            if sf.get("S", 0) > 0:
+                cands.append(("%d×太阳轮" % npl, npl * float(sf["S"])))
+        res = gear_sideband_verdict(self._cur_f, self._cur_amp, mesh, cands)
+        # 卡片只留结论本身（齿轮级名不写，级次在对话框里已选，图上也有“啮合”标线）
+        lines = ["GMF %.1fHz" % mesh]
+        r = float(res.get("ratio") or 0.0)
+        lvl = "轻微" if r < 0.10 else ("明显" if r < 0.30 else "严重")
+        if res.get("match"):
+            m = str(res["match"])
+            lines.append("边带 %.2fHz ≈ %s（%d 处）"
+                         % (res.get("spacing") or 0.0, m, len(res.get("hits") or [])))
+            if "GMF/" in m:
+                lines.append("→ 周向 %s 个齿均布损伤" % m.split("/")[1].split("×")[0])
+            elif "太阳轮" in m:
+                lines.append("→ 行星级太阳轮")
+            else:
+                lines.append("→ %s一侧的齿轮" % m.replace("转频", ""))
+            lines.append("边带/主峰 %.2f · %s" % (r, lvl))
+        elif res.get("peaks"):
+            if res.get("weak"):
+                lines.append("边带 %.2fHz ≈ %s（仅一侧）"
+                             % (res.get("spacing") or 0.0, res["weak"]))
+            else:
+                lines.append("边带 %.2fHz，未对上轴转频/GMF÷n" % (res.get("spacing") or 0.0))
+            lines.append("边带/主峰 %.2f · %s" % (r, lvl))
+        else:
+            lines.append("无调制边带（当前以啮合谐波为主）")
+        # 频谱形态 → 疑似故障类型（证据带出来，结论只写“疑似”）
+        try:
+            _ev = spectrum_evidence(self._cur_f, self._cur_amp,
+                                    self.current_machine()[1], f_hss,
+                                    sig=getattr(self, "sig", None))
+            _modes = fault_modes(_ev, point=(self.info or {}).get("point"))
+        except Exception:
+            _modes = []
+        if _modes:
+            _nm, _sc, _why = _modes[0]
+            lines.append("疑似 %s %.0f%%" % (_nm, _sc * 100.0))
+            if _why:
+                lines.append("依据 " + "、".join(_why[:2]))
+        return (GEAR_COLOR, "齿轮判读", lines)
+
+    @staticmethod
+    def _label_row(placed, hz, half, n_rows):
+        """给频率处的横排标签挑一个不重叠的行。
+
+        placed 为 [(行号, x, 半宽)]，就地追加；半宽按字数估，避免“BPFO/BPFI”挤成一团。
+        """
+        for r in range(n_rows):
+            clash = False
+            for pr, px, ph in placed:
+                if pr == r and abs(px - hz) < (ph + half):
+                    clash = True
+                    break
+            if not clash:
+                placed.append((r, hz, half))
+                return r
+        placed.append((n_rows - 1, hz, half))
+        return n_rows - 1
+
+    @staticmethod
+    def _label_half(text, span):
+        """横排标签的半宽（数据单位）：按字数估，中文比数字宽。"""
+        n = len(str(text or ""))
+        return (0.0035 * n + 0.004) * max(1e-9, span)
+
     def _draw_gear_marks(self, ax):
-        """画啮合频率（粗线+文字）和边带（细淡线）。"""
+        """画啮合频率（粗线+文字）和边带（细淡线）；文字在频率处横排，重叠时错行。"""
         if not self._gear_marks:
             return
         try:
             x0, x1 = ax.get_xlim()
+            placed = []
+            rows = (1.008, 1.042, 1.076)
+            span = max(1e-9, x1 - x0)
             for item in self._gear_marks:
                 hz = float(item["hz"])
                 if hz < x0 or hz > x1:
@@ -2590,7 +4098,9 @@ class SpectrumWindow(tk.Toplevel):
                            lw=item.get("lw", 1.0), alpha=0.95 if item["label"] else 0.55,
                            zorder=1.6)
                 if item["label"]:
-                    ax.text(hz, 1.008, item["label"], rotation=90,
+                    half = self._label_half(item["label"], span)
+                    r = self._label_row(placed, hz, half, len(rows))
+                    ax.text(hz, rows[r], item["label"], rotation=0,
                             transform=ax.get_xaxis_transform(),
                             va="bottom", ha="center", fontsize=6.2,
                             color=item["color"], zorder=8, clip_on=False,
@@ -2599,33 +4109,30 @@ class SpectrumWindow(tk.Toplevel):
         except Exception:
             pass
 
-    def _apply_auto_bearing_marks(self):
-        """按“项目 + 测点”自动标注轴承特征频率；只有登记过的项目（府谷）才生效。"""
+    def _apply_auto_bearing_marks(self, rpm=None):
+        """按“项目 + 测点”自动标注轴承特征频率；机型与测点映射来自 数据\机型库.json。"""
         self._bearing_marks = []
         self._auto_bearing_used = False
-        if not getattr(self, "_auto_bearing_on", True):
+        if not getattr(self, "_auto_bearing_on", False):
             return
         info = self.info or {}
         proj = str(info.get("project") or "")
         pt = str(info.get("point") or "")
         if wf_bad_point(proj, info.get("unit"), pt):
             return
-        mapping = None
-        for pk, pm in BEARING_PROJECT_MAP.items():
-            if pk and pk in proj:
-                mapping = pm
-                break
-        if not mapping:
+        prof = self.current_machine()[1]
+        if not prof:
             return
         names = None
-        for kw, blist in mapping:
-            if kw and kw in pt:
+        pt_cmp = pt.replace("_", "")      # 测点名带不带下划线两种写法都要能匹配
+        for kw, blist in prof.get("points") or []:
+            if kw and kw.replace("_", "") in pt_cmp:
                 names = blist
                 break
         if not names:
             return
         try:
-            rpm = float(info.get("speed") or 0)
+            rpm = float(info.get("speed") or 0) if rpm is None else float(rpm)
         except (TypeError, ValueError):
             rpm = 0.0
         if rpm <= 0:
@@ -2644,12 +4151,7 @@ class SpectrumWindow(tk.Toplevel):
             base = f.get(shaft, 0.0)
             if base <= 0:
                 continue
-            if ("B12" in nm) or ("B13" in nm):
-                short = "6332"          # 同一型号 6332MC4（B12/B13 倍数一致）
-            elif "SKF" in nm:
-                short = "SKF"
-            else:
-                short = ""
+            short = bearing_tag(nm)
             tag = (short + "-") if (multi and short) else ""
             for k in ("BPFI", "BPFO", "BSF", "FTF"):
                 m = mult.get(k)
@@ -2660,68 +4162,108 @@ class SpectrumWindow(tk.Toplevel):
         self._bearing_marks = marks
         self._auto_bearing_used = bool(marks)
 
-    def _toggle_auto_bearing(self):
-        self._auto_bearing_on = not getattr(self, "_auto_bearing_on", True)
-        if self._auto_bearing_on:
-            self._apply_auto_bearing_marks()
-        else:
-            self._bearing_marks = []
-            self._auto_bearing_used = False
-        self._redraw_current_plot()
+    def current_machine(self):
+        """当前谱图用的机型 (机型名, profile)：手选优先，否则按项目名自动匹配。
+
+        两者都没有时返回 (None, None)——此时只知道高速轴转频，别的轴不画，宁缺勿猜。
+        """
+        sel = getattr(self, "_machine_name", None)
+        if sel and sel in MACHINE_LIB:
+            return sel, MACHINE_LIB[sel]
+        return machine_for_project((getattr(self, "info", None) or {}).get("project"))
 
     def _bearing_shaft_freqs(self, f_hss):
-        """由高速轴(发电机)转频算各轴转频(Hz)。"""
-        fM = f_hss / GB_I3
-        fS = fM / GB_I2
-        fL = fS / GB_I1
-        return {"H": f_hss, "M": fM, "S": fS, "L": fL, "P": fL * GB_ZR / GB_ZP}
+        """由高速轴(发电机)转频算各轴转频(Hz)；齿轮比取当前机型（每个项目不同）。"""
+        return shaft_freqs(f_hss * 60.0, self.current_machine()[1])
+
+    def _is_gear_point(self):
+        """当前测点是不是齿轮箱上的（只有齿轮箱才给「齿轮频率」入口）。
+
+        发电机/主轴承测点也能看到 GMF，但那是从箱体传过去的，在上面标齿面故障没有物理依据。
+        """
+        return "齿轮箱" in str((self.info or {}).get("point") or "")
+
+    def _bearing_names_for_point(self):
+        """当前测点的候选轴承（机型库 points 里的列表；下划线不敏感）。"""
+        prof = self.current_machine()[1]
+        pt = str((self.info or {}).get("point") or "").replace("_", "")
+        for kw, blist in (prof or {}).get("points") or []:
+            if kw and kw.replace("_", "") in pt:
+                return list(blist)
+        return []
 
     def _bearing_dialog(self):
         """选轴承 + 转速，在谱图上标注 BPFI/BPFO/BSF/FTF（含谐波）。"""
         f0 = self._get_rot_hz()
         rpm0 = (f0 * 60.0) if f0 > 0 else 0.0
         dlg = tk.Toplevel(self)
-        dlg.title("轴承特征频率标注")
+        dlg.title("轴承特征频率")
         dlg.transient(self); dlg.resizable(False, False)
         frm = ttk.Frame(dlg, padding=12); frm.pack(fill="both", expand=True)
         ttk.Label(frm, text="选择轴承与转速，标注 BPFI / BPFO / BSF / FTF：").grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        # 机型决定「各轴转频」，每个项目不一样；默认按项目名自动匹配，未登记的也可手选
+        cur_name = self.current_machine()[0]
+        v_m = tk.StringVar(value=cur_name or AUTO_MACHINE)
+        ttk.Label(frm, text="机型：").grid(row=1, column=0, sticky="e", pady=3)
+        ttk.Combobox(frm, textvariable=v_m, state="readonly", width=30,
+                     values=[AUTO_MACHINE] + machine_names()).grid(row=1, column=1, sticky="w", pady=3)
         names = list(BEARING_LIB.keys())
         v_b = tk.StringVar(value=self._bearing_sel or names[0])
-        ttk.Label(frm, text="轴承：").grid(row=1, column=0, sticky="e", pady=3)
+        ttk.Label(frm, text="轴承：").grid(row=2, column=0, sticky="e", pady=3)
         cb = ttk.Combobox(frm, textvariable=v_b, values=names, width=30, state="readonly")
-        cb.grid(row=1, column=1, sticky="w", pady=3)
+        cb.grid(row=2, column=1, sticky="w", pady=3)
         v_rpm = tk.StringVar(value=("%.0f" % rpm0) if rpm0 > 0 else "")
-        ttk.Label(frm, text="高速轴转速(rpm)：").grid(row=2, column=0, sticky="e", pady=3)
-        ttk.Entry(frm, textvariable=v_rpm, width=12).grid(row=2, column=1, sticky="w", pady=3)
+        ttk.Label(frm, text="高速轴转速(rpm)：").grid(row=3, column=0, sticky="e", pady=3)
+        ttk.Entry(frm, textvariable=v_rpm, width=12).grid(row=3, column=1, sticky="w", pady=3)
         v_ord = tk.StringVar(value="1")
-        ttk.Label(frm, text="谐波次数：").grid(row=3, column=0, sticky="e", pady=3)
+        ttk.Label(frm, text="谐波次数：").grid(row=4, column=0, sticky="e", pady=3)
         ttk.Combobox(frm, textvariable=v_ord, values=["1", "2", "3"], width=5,
-                     state="readonly").grid(row=3, column=1, sticky="w", pady=3)
+                     state="readonly").grid(row=4, column=1, sticky="w", pady=3)
         keys = {}
-        box = ttk.Frame(frm); box.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        box = ttk.Frame(frm); box.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
         for i, k in enumerate(("BPFI", "BPFO", "BSF", "FTF")):
             v = tk.BooleanVar(value=(k in ("BPFI", "BPFO")))
             ttk.Checkbutton(box, text=k, variable=v).grid(row=0, column=i, padx=6)
             keys[k] = v
         # 自定义倍数：库里没有的轴承（或临时改倍数）可直接填特征倍数。
         # 留空 = 用 BEARING_LIB 的库值；填了 = 按所选轴承的轴转频覆盖对应项。
-        ttk.Label(frm, text="自定义倍数(可留空)：").grid(row=5, column=0, sticky="e", pady=3)
-        cbox = ttk.Frame(frm); cbox.grid(row=5, column=1, sticky="w", pady=3)
+        ttk.Label(frm, text="自定义倍数(可留空)：").grid(row=6, column=0, sticky="e", pady=3)
+        cbox = ttk.Frame(frm); cbox.grid(row=6, column=1, sticky="w", pady=3)
         v_cust = {}
         for _i, _k in enumerate(("BPFI", "BPFO", "BSF", "FTF")):
             ttk.Label(cbox, text=_k).grid(row=0, column=_i * 2, padx=(0 if _i == 0 else 6, 1))
             v_cust[_k] = tk.StringVar(value="")
             ttk.Entry(cbox, textvariable=v_cust[_k], width=6).grid(row=0, column=_i * 2 + 1)
+        # 自动 / 手动合成一个入口：勾上就按测点匹配机型库里的轴承（不用再选轴承/勾特征）
+        v_auto = tk.BooleanVar(value=bool(getattr(self, "_auto_bearing_on", False)))
+        ttk.Checkbutton(frm, text="自动：按测点匹配机型库里的轴承（用上面的转速）",
+                        variable=v_auto).grid(row=7, column=0, columnspan=2,
+                                              sticky="w", pady=(8, 0))
         res = {"ok": False}
 
         def ok():
+            auto = bool(v_auto.get())
             try:
                 rpm = float(v_rpm.get())
             except Exception:
                 messagebox.showerror("输入错误", "转速请填数字。", parent=dlg); return
             if rpm <= 0:
                 messagebox.showerror("输入错误", "转速必须大于 0。", parent=dlg); return
+            self._machine_name = v_m.get() if v_m.get() in MACHINE_LIB else None
+            self._rot_hz = rpm / 60.0
+            self._auto_bearing_on = auto
+            if auto:
+                self._apply_auto_bearing_marks(rpm)
+                if not self._bearing_marks:
+                    messagebox.showwarning(
+                        "没有可标的轴承",
+                        "机型库里这个测点没登记轴承，或机型/转速对不上。\n"
+                        "取消勾选「自动」后可以手选轴承。", parent=dlg)
+                    return
+                res["ok"] = True
+                dlg.destroy()
+                return
             sel = [k for k, v in keys.items() if v.get()]
             if not sel:
                 messagebox.showerror("输入错误", "至少勾选一个特征频率。", parent=dlg); return
@@ -2733,6 +4275,13 @@ class SpectrumWindow(tk.Toplevel):
                 messagebox.showerror("计算失败", "转速换算失败。", parent=dlg); return
             shaft, mult = BEARING_LIB[v_b.get()]
             base = f.get(shaft, 0.0)
+            if base <= 0:
+                messagebox.showerror(
+                    "换算不了",
+                    "当前机型没有「%s」轴的转频比。\n请在 数据\\机型库.json 里补 shafts.%s，"
+                    "或在对话框上方换一个机型。" % (shaft, shaft),
+                    parent=dlg)
+                return
             _cust = {}
             for _k, _v in v_cust.items():
                 try:
@@ -2758,7 +4307,7 @@ class SpectrumWindow(tk.Toplevel):
             res["ok"] = True
             dlg.destroy()
 
-        bf = ttk.Frame(frm); bf.grid(row=6, column=0, columnspan=2, pady=(10, 0), sticky="e")
+        bf = ttk.Frame(frm); bf.grid(row=8, column=0, columnspan=2, pady=(10, 0), sticky="e")
         ttk.Button(bf, text="确定", command=ok).pack(side="left", padx=4)
         ttk.Button(bf, text="取消", command=dlg.destroy).pack(side="left", padx=4)
         dlg.bind("<Return>", lambda e: ok())
@@ -2773,15 +4322,16 @@ class SpectrumWindow(tk.Toplevel):
         self._redraw_current_plot()
 
     def _draw_bearing_marks(self, ax):
-        """把轴承特征频率画成竖虚线 + 顶部标签（只在频率轴上画）。"""
+
+        """把轴承特征频率画成竖虚线 + 频率处横排标签（重叠时错行）。"""
         if not self._bearing_marks:
             return
         try:
             x0, x1 = ax.get_xlim()
             y0, y1 = ax.get_ylim()
-            span = (y1 - y0) or 1.0
-            top = y1 - span * 0.015
-            shown = 0
+            placed = []
+            rows = (1.008, 1.042, 1.076)
+            span = max(1e-9, x1 - x0)
             for item in self._bearing_marks:
                 hz = float(item["hz"])
                 if hz < x0 or hz > x1:
@@ -2793,12 +4343,14 @@ class SpectrumWindow(tk.Toplevel):
                            alpha=0.9 if first else 0.5, zorder=1.5)
                 if not first:
                     continue
-                ax.text(hz, 1.008, "%s %.0f" % (item["label"], hz), rotation=90,
+                txt = "%s %.0f" % (item["label"], hz)
+                half = self._label_half(txt, span)
+                r = self._label_row(placed, hz, half, len(rows))
+                ax.text(hz, rows[r], txt, rotation=0,
                         transform=ax.get_xaxis_transform(),
                         va="bottom", ha="center", fontsize=6.2, color=item["color"],
                         zorder=8, clip_on=False,
                         bbox=dict(boxstyle="round,pad=0.06", fc="white", ec="none", alpha=0.75))
-                shown += 1
         except Exception:
             pass
 
@@ -2814,6 +4366,16 @@ class SpectrumWindow(tk.Toplevel):
                 ymax = ax.get_ylim()[1]
                 ax.set_ylim(0, ymax * 1.25)
         # 细化模式：x轴左右各留边距（时域图也支持）
+        if self.refine_range is not None:
+            r0, r1 = self.refine_range
+            # 防御：跨度异常小（误点把 refine 设成 0.001Hz）时视为无效，
+            # 否则视图会塌成一根线（“缩小后点细化，谱图缩到最小”）
+            try:
+                _full = self._zoom_bounds()
+                if (float(r1) - float(r0)) < max((float(_full[1]) - float(_full[0])) * 0.001, 1e-9):
+                    self.refine_range = None
+            except Exception:
+                pass
         if self.refine_range is not None:
             r0, r1 = self.refine_range
             pad = (r1 - r0) * 0.05
@@ -2848,20 +4410,21 @@ class SpectrumWindow(tk.Toplevel):
         if not self.marks_hidden and self.current_plot in ("fft", "envelope", "velocity"):
             self._draw_bearing_marks(ax)
             self._draw_gear_marks(ax)
+        self._draw_freq_cursor(ax)
         if (not self.marks_hidden and self.active_mark_x is not None
                 and self.current_plot in ("fft", "envelope", "velocity", "stft", "autocorr")):
             self._draw_active_mark(ax)
         if self.refine_on and not self.axis_locked:
             # fig.clear()后旧selector已废，在新ax上重建，保证每次框选都有淡红跟随
             self._destroy_selector()
-            self.rs = RectangleSelector(ax, self._on_select_refine, useblit=False, button=[1],
+            self.rs = RectangleSelector(ax, self._on_select_refine, useblit=True, button=[1],
                 minspanx=3, minspany=3, spancoords='pixels', interactive=False,
                 props=dict(edgecolor='none', facecolor='red', alpha=0.15))
         if not self.marks_hidden and _freq_plot:
             self._draw_annotation_panel(ax)
         # rect 顶部预留 5% 灰区用于摆放悬浮图标（标题已移到画布外独立条带）；
         # pad=0.4 收紧绘图区四周浅灰留白（默认 1.08 偏宽），在不裁切轴标签/色标的前提下放大波形区
-        self.fig.tight_layout(rect=(0, 0, 1, 0.95), pad=0.4)
+        self.fig.tight_layout(rect=(0, 0, 1, 0.965), pad=0.4)
         if len(self.fig.axes) == 1:
             # 四边边距按“画布像素 + 屏幕 DPI”换算：窗口小/系统缩放时给刻度文字多留一些，
             # 窗口大时按固定像素收紧，绘图区随之变大（拉伸/缩放都能自适应，标签不会被裁）
@@ -2871,13 +4434,26 @@ class SpectrumWindow(tk.Toplevel):
                 k = float(self.fig.dpi) / 96.0
                 left = min(0.22, max(0.09, 62.0 * k / wpx))
                 bottom = min(0.28, max(0.12, 36.0 * k / hpx))
-                top = 1.0 - min(0.16, max(0.07, 30.0 * k / hpx))
+                # 顶部留白只给悬浮图标（约 3%）：谱图尽量往上靠，标题/采集时间离图更近，
+                # 快捷键截图时能一起入画
+                top = 1.0 - min(0.12, max(0.05, 24.0 * k / hpx))
                 right = 1.0 - min(0.10, max(0.015, 14.0 * k / wpx))
                 if self._bearing_marks or self._gear_marks:
-                    top = min(top, 1.0 - 0.10)   # 给标注文字留一条窄带
+                    top = min(top, 1.0 - 0.10)   # 给横排标注（最多 3 行错开）留出窄带
+                if self.current_plot == "stft":
+                    top = min(top, 1.0 - 0.10)   # 瀑布图主频标签画在坐标区外
                 self.fig.subplots_adjust(left=left, right=right, top=top, bottom=bottom)
             except Exception:
                 pass
+        # 记录“完整视图”范围（只在没有细化时记）：缩小按钮以它为上限，
+        # 否则会一路缩到 Nyquist（如 0–12800Hz），把只看 0–5000Hz 的谱挤成左边一小条
+        if self.refine_range is None:
+            try:
+                self._full_xlim = (self.current_plot,
+                                   tuple(float(v) for v in self.fig.gca().get_xlim()))
+            except Exception:
+                pass
+        self._draw_rms_box(ax)
         self.canvas.draw()
         self._schedule_save_annotations()
         # 谱图首次绘出后按当前范围自动锁定（所有谱图默认锁定 X/Y）：
@@ -2888,6 +4464,113 @@ class SpectrumWindow(tk.Toplevel):
                 self._set_locked(True)
         self._position_chart_tools()
         self.canvas.get_tk_widget().focus_set()
+
+    def _plot_rms_unit(self):
+        """当前谱图左上角 RMS 框用的单位。"""
+        if self.current_plot == "velocity":
+            return "mm/s"
+        # 用 mathtext 写平方：SimHei 里 U+00B2 可能缺字，会显示成豆腐块
+        return "m/s$^2$"
+
+    def _rms_spectrum(self):
+        """算 overall/基频有效值用的谱：普通谱图用当前谱线，
+        瀑布图（STFT 平均谱，幅值口径与全记录 FFT 不同）改用原始信号的全记录 FFT。"""
+        f, a = self._cur_f, self._cur_amp
+        if (self.current_plot == "stft" and self.sig is not None and self.fs):
+            try:
+                key = (id(self.sig), len(self.sig), float(self.fs))
+                cache = getattr(self, "_rms_spec_cache", None)
+                if cache is None or cache[0] != key:
+                    x = np.asarray(self.sig, dtype=float)
+                    x = x - float(x.mean())
+                    n = len(x)
+                    amp = 2.0 * np.abs(np.fft.rfft(x)) / float(n)
+                    fr = np.fft.rfftfreq(n, 1.0 / float(self.fs))
+                    cache = (key, fr, amp)
+                    self._rms_spec_cache = cache
+                return cache[1], cache[2]
+            except Exception:
+                pass
+        return f, a
+
+    def _spectrum_rms(self, lo=None, hi=None):
+        """按幅值谱积分算有效值：sqrt(Σa²/2)。
+
+        图上画的是单边**峰值**谱（正弦幅值 A 对应一根 a≈A 的谱线），
+        所以整段/某频带的有效值 = sqrt(Σ(a²)/2)，不是直接对谱线求和。
+        """
+        f, a = self._rms_spectrum()
+        if f is None or a is None or len(f) < 2:
+            return None
+        try:
+            f = np.asarray(f, dtype=float)
+            a = np.asarray(a, dtype=float)
+        except Exception:
+            return None
+        if lo is None:
+            m = np.ones_like(f, dtype=bool)
+        else:
+            m = (f >= lo) & (f <= hi)
+        if not np.any(m):
+            return None
+        try:
+            return float(np.sqrt(np.sum(a[m] ** 2) / 2.0))
+        except Exception:
+            return None
+
+    def _base_freq_marks(self):
+        """当前谱图上的基频（活动基频 + 历史 f0 标记），按出现顺序去重。"""
+        vals = []
+        if self.active_mark_x:
+            vals.append(float(self.active_mark_x))
+        for mk in (self.manual_marks or []):
+            try:
+                if len(mk) >= 2 and str(mk[1]) == "f0":
+                    vals.append(float(mk[0]))
+            except Exception:
+                continue
+        out = []
+        for v in vals:
+            if v > 0 and all(abs(v - u) > 1e-6 for u in out):
+                out.append(v)
+        return out
+
+    def _draw_rms_box(self, ax):
+        """坐标区左上角信息：overall RMS + 每个基频有效值。
+
+        样式与右上角倍频面板一致：**无边框、无背景**，标题 7.8pt 加粗、
+        明细 7.0pt / 颜色 #2b3d51 / 行距 1.25；位置在坐标区内部左上，
+        轴承/齿轮频率标签画在坐标区外（y>1.0），不会和它们重叠。
+        单位用 mathtext 写（m/s$^2$），避免 Superscript-2 在 SimHei 里缺字变成豆腐块。
+        """
+        if self.current_plot not in ("fft", "envelope", "velocity", "stft"):
+            return
+        unit = self._plot_rms_unit()
+        total = self._spectrum_rms()
+        if total is None:
+            return
+        # 给信息留出头顶空间：纵轴上限抬到最高谱线的 1.25 倍，
+        # 否则低频高幅值谱线会顶进文字里（锁定视图时不动纵轴）
+        try:
+            if not getattr(self, "axis_locked", False):
+                a_arr = np.asarray(self._cur_amp, dtype=float)
+                fx = np.asarray(self._cur_f, dtype=float)
+                vx0, vx1 = ax.get_xlim()
+                m = (fx >= vx0) & (fx <= vx1)
+                if m.any():
+                    y0, y1 = ax.get_ylim()
+                    top = float(np.max(a_arr[m]))
+                    if top > 0:
+                        need = y0 + (top - y0) * 1.25
+                        if need > y1:
+                            ax.set_ylim(y0, need)
+        except Exception:
+            pass
+        if total is not None:
+            _head = ("overall RMS %.3f %s" % (total, unit)).strip()
+            ax.text(0.012, 0.975, _head,
+                    transform=ax.transAxes, ha="left", va="top", fontsize=7.8,
+                    fontweight="bold", color="#2b3d51", zorder=12, clip_on=True)
 
     def _amp_at(self, x):
         """取当前谱线在频率 x 处的幅值（用于把标注线限制在真实谱线高度内）。"""
@@ -3162,6 +4845,16 @@ class SpectrumWindow(tk.Toplevel):
                     left = cells[i] if cells[i] else " " * 20
                     right = cells[i + half] if (i + half < len(cells) and cells[i + half]) else ""
                     lines.append((left + "   " + right).rstrip())
+                # 这个基频最像哪只轴承的哪个阶次（多候选里取最近的）
+                try:
+                    _sh = self._bearing_shaft_freqs(self._rot_hz) if self._rot_hz else {}
+                    _names = self._bearing_names_for_point()
+                    _hint = bearing_hint(base, _sh, _names) if (_sh and _names) else None
+                    if _hint:
+                        lines.append("≈ %s %s（%.1fHz，%+.1f%%）"
+                                     % (_hint[0], _hint[1], _hint[2], _hint[3] * 100.0))
+                except Exception:
+                    pass
             if d["sb"]:
                 bw = self._sideband_params.get(round(base, 2), 0.0)
                 tags.append(f"边带 ±3SB({bw:.1f}Hz)")
@@ -3182,7 +4875,7 @@ class SpectrumWindow(tk.Toplevel):
                     # BWx 标在带内峰值处，面板同步显示峰频率与峰值（两位小数，便于对照谱线）
                     pk = float(r.get("peak", r["hi"]) or r["hi"])
                     lines.append(f"{r['label']:<4}{pk:>8.2f}Hz{r['amp']:>6.2f}")
-            header = f"◆ f0={base:.2f}Hz   " + "   ".join(tags)
+            header = f"◆ f1={base:.2f}Hz   " + "   ".join(tags)
             out.append((color, header, lines))
         return out
 
@@ -3191,8 +4884,14 @@ class SpectrumWindow(tk.Toplevel):
         return os.path.join(base, ANNOT_FILE) if base else ""
 
     def _point_key(self):
+        """标注按“测点 + 这份记录”存：同一测点切换数据时不沿用上一份的基频/标线。"""
         info = self.info or {}
-        return "|".join(str(info.get(k, "") or "") for k in ("project", "unit", "point"))
+        base = "|".join(str(info.get(k, "") or "") for k in ("project", "unit", "point"))
+        dt = info.get("dt")
+        stamp = dt.strftime("%Y%m%d_%H%M%S") if dt else ""
+        if not stamp and self.csv_path:
+            stamp = os.path.basename(self.csv_path)
+        return base + "|" + stamp
 
     def _collect_annotations(self):
         return {
@@ -3285,8 +4984,15 @@ class SpectrumWindow(tk.Toplevel):
             self._redraw_current_plot()
 
     def _draw_annotation_panel(self, ax):
-        """右上角信息卡：按基频分块、左对齐、无边框；带 −/+ 折叠按钮。"""
-        blocks = self._annotation_text_blocks()
+        """右上角信息卡：按基频分块 + 齿轮判读块，左对齐、无边框；带 −/+ 折叠按钮。"""
+        blocks = list(self._annotation_text_blocks())
+        gear_blk = None
+        try:
+            gear_blk = self._gear_diag_block()
+        except Exception:
+            gear_blk = None
+        if gear_blk:
+            blocks.append(gear_blk)
         if not blocks:
             return
         if self._panel_collapsed:
@@ -3303,7 +5009,7 @@ class SpectrumWindow(tk.Toplevel):
         for color, header, lines in blocks:
             h = TextArea(header, textprops=dict(color=color, fontsize=7.8, weight="bold"))
             b = TextArea("\n".join(lines), textprops=dict(color="#2b3d51", fontsize=7.0,
-                                                         family="SimSun", linespacing=1.1))
+                                                         multialignment="left", linespacing=1.25))
             boxes.append(VPacker(children=[h, b], align="left", pad=0, sep=0))
         pack = VPacker(children=boxes, align="left", pad=0, sep=3)
         ab = AnnotationBbox(pack, (0.972, 0.975), xycoords=ax.transAxes,
@@ -3510,7 +5216,13 @@ class SpectrumWindow(tk.Toplevel):
             self.single_line_on = False
             self.mark_time_on = False
             self._destroy_selector()
-            for _b in (self.btn_refine, self.btn_annotate, self.btn_single):
+            self.fcdiff_on = False
+            try:
+                self._set_on(self.btn_fcdiff, False)
+            except Exception:
+                pass
+            self._fc_t = []
+            for _b in (self.btn_refine, self.btn_annotate, self.btn_tcursor, self.btn_fcdiff):
                 try:
                     self._set_on(_b, False)
                 except Exception:
@@ -3538,6 +5250,7 @@ class SpectrumWindow(tk.Toplevel):
                       bool(getattr(self, "_period_from_autocorr", False)))
         _prev_plot = self.current_plot
         self.current_plot = name
+        self._zoom_hi = None
         # 换谱图类型后原锁定范围无意义，先解锁；瀑布图/自相关保持可交互（不自动锁定）
         if self.axis_locked:
             self._set_locked(False)
@@ -3551,27 +5264,43 @@ class SpectrumWindow(tk.Toplevel):
         # 同一测点切换谱图时保留标注；只有 load_file 打开新文件/测点时才清空
         self.annotate_mode = False
         self._set_on(self.btn_annotate, False)
-        # 左上角悬浮条按谱类型显隐：基频/频率仅时域，峰值各谱通用，基频/倍频/边带/带宽仅频域类
-        _all_left = (self.btn_single, self.btn_freq, self.btn_annotate,
-                     self.btn_harm, self.btn_side, self.btn_bw, self.btn_peak)
+        # 离开频域谱图就把频差关掉（横轴已经不是频率）
+        if name not in self._DIFF_PLOTS and getattr(self, "fcdiff_on", False):
+            self.fcdiff_on = False
+            self._fc_t = []
+            try:
+                self._set_on(self.btn_fcdiff, False)
+            except Exception:
+                pass
+        # 离开时域就把时间游标关掉，避免回到时域时残留旧游标
+        if name != "time" and getattr(self, "tcursor_on", False):
+            self.tcursor_on = False
+            self._tc_t = []
+            try:
+                self._set_on(self.btn_tcursor, False)
+            except Exception:
+                pass
+        # 左上角悬浮条按谱类型显隐：时间游标仅时域，峰值各谱通用，基频/倍频/边带/带宽仅频域类
+        _all_left = (self.btn_tcursor, self.btn_annotate,
+                     self.btn_harm, self.btn_side, self.btn_bw, self.btn_fcdiff, self.btn_peak)
         for btn in _all_left:
             btn.pack_forget()
         if name == "time":
-            self.btn_single.pack(side="left", padx=4)
-            self.btn_freq.pack(side="left", padx=4)
+            self.btn_tcursor.pack(side="left", padx=4)
         elif name == "stft":
             # 瀑布图：锁定后仍可用“基频”选主频、方向键微调，Shift+滚轮细化
-            for btn in (self.btn_annotate, self.btn_peak):
+            for btn in (self.btn_annotate, self.btn_fcdiff, self.btn_peak):
                 btn.pack(side="left", padx=4)
         elif name == "autocorr":
             # 自相关：用“基频”按钮选周期，之后方向键/Shift+方向微调，Shift+滚轮细化
-            for btn in (self.btn_annotate, self.btn_peak):
+            for btn in (self.btn_annotate, self.btn_fcdiff, self.btn_peak):
                 btn.pack(side="left", padx=4)
         elif name in ("fft", "envelope", "order", "velocity"):
-            for btn in (self.btn_annotate, self.btn_harm, self.btn_side, self.btn_bw, self.btn_peak):
+            for btn in (self.btn_annotate, self.btn_harm, self.btn_side, self.btn_bw,
+                        self.btn_fcdiff, self.btn_peak):
                 btn.pack(side="left", padx=4)
         elif name == "cepstrum":
-            for btn in (self.btn_annotate, self.btn_harm, self.btn_peak):
+            for btn in (self.btn_annotate, self.btn_harm, self.btn_fcdiff, self.btn_peak):
                 btn.pack(side="left", padx=4)
         # autocorr 无任何左浮按钮：有可见项则贴画布左上角顶部显示，否则整条隐藏
         if any(b.winfo_manager() for b in _all_left):
@@ -3619,10 +5348,15 @@ class SpectrumWindow(tk.Toplevel):
     def load_file(self, path):
         self.csv_path = path; self.last_dir = os.path.dirname(path)
         self.lbl.config(text=path); self.info = parse_filename(os.path.basename(path))
+        # 换了项目就把手选机型清掉，重新按项目名自动匹配（同一项目连续看文件则保留手选）
+        _proj = str((self.info or {}).get("project") or "")
+        if _proj != getattr(self, "_machine_proj", None):
+            self._machine_proj = _proj
+            self._machine_name = None
         self.fs = self.info["fs"]
         self._rot_hz = None          # 换文件：回到“按文件名转速”，没有就等用户给
         self._bearing_marks = []     # 换文件：清掉上一份数据的轴承标注
-        self._gear_marks = []        # 换文件：清掉齿轮啮合/边带标注
+        self._gear_marks = []        # 换文件：清掉齿轮频率标注
         if not (self.info.get("speed") or 0):
             # 文件名没转速时，用表格里“设置转速”写下的同目录 sidecar
             try:
@@ -3646,14 +5380,30 @@ class SpectrumWindow(tk.Toplevel):
             self.info.setdefault("point", ""); self.info.setdefault("speed", None)
             self.info.setdefault("dt", None)
             self.fs = float(fs_in)
+        _meta = {"multi": False, "ncols": 1}
         try:
-            self.sig = pd.read_csv(path, header=None).iloc[:, 0]
-            self.sig = pd.to_numeric(self.sig, errors="coerce").dropna().values.astype(float)
+            self.sig, _meta = read_signal_csv(path)
         except Exception as e:
             messagebox.showerror("读文件错误", str(e))
             self._clear_loaded_data("未加载数据（文件读取失败）")
             return
-        if len(self.sig) < 1024: messagebox.showerror("错误", "数据点太少")
+        if len(self.sig) == 0:
+            messagebox.showerror(
+                "格式不支持",
+                "这个 CSV 里没有可用数值。\n\n%s\n\n需要单列数值，或“时间,幅值”这类含数值列的多列文件。"
+                % os.path.basename(path))
+            self._clear_loaded_data("未加载数据（CSV 无可用数值）")
+            return
+        # 数据体检：点数/时长、多列 CSV、采样率与测点分析频带是否匹配——一次性弹窗说清楚
+        _n = int(len(self.sig))
+        _fn = os.path.basename(getattr(self, "csv_path", None) or path)
+        try:
+            _warns = data_health_warnings(_n, self.fs, self.info.get("point"), _meta)
+        except Exception:
+            _warns = []
+        self._low_samples = any("采样点数不足" in x for x in _warns)
+        if _warns:
+            messagebox.showwarning("数据检查", "文件：%s\n\n" % _fn + "\n\n".join(_warns))
         pt = self.info["point"]
         if pt in rule_dict:
             self.var_bp_low.set(str(rule_dict[pt]["f_low"]))
@@ -3679,6 +5429,7 @@ class SpectrumWindow(tk.Toplevel):
         self.manual_marks = []
         self.active_mark_x = None
         self._xmax_override = None
+        self._zoom_hi = None
         self._harmonics_text = None
         self._sidebands_text = None
         self._bandwidth_text = None
@@ -3743,23 +5494,144 @@ class SpectrumWindow(tk.Toplevel):
         self.chart_title.config(text=f"{line1}\n{line2}")
         return ax
 
-    def _toggle_mark_time(self):
-        self.mark_time_on = not self.mark_time_on
-        _b = getattr(self, "btn_mark_time", None)  # 该按钮当前无 UI 入口，存在才更新，避免属性错误
-        if _b is not None:
-            _b.config(text=f"手动标注:{'开' if self.mark_time_on else '关'}")
+    def _toggle_time_cursor(self):
+        """时间游标（时域双游标）：打开后点两次定 A/B，方向键微调，读出 Δt 与 1/Δt。"""
+        self.tcursor_on = not getattr(self, "tcursor_on", False)
+        self._set_on(self.btn_tcursor, self.tcursor_on)
+        # 互斥：打开时把其它点击模式关掉，避免一次点击被两处消费
+        if self.tcursor_on:
+            self._tc_t = []
+            self._tc_active = 0
+            self.single_line_on = False
+            self.mark_time_on = False
+            self.annotate_mode = False
+        else:
+            self._tc_t = []
+        self._redraw_current_plot()
 
-    def _toggle_single_line(self):
-        self._single_relock = self.axis_locked
-        if self.axis_locked:
-            self._set_locked(False)
-        self.single_line_on = not self.single_line_on
-        self._set_on(self.btn_single, self.single_line_on)
-        if self.single_line_on:
-            self._single_start_t = None
-        elif getattr(self, "_single_relock", False):
-            # 取消取点：回到锁定态
-            self._set_locked(True)
+    def _finish_time_cursor(self):
+        """A/B 都定好后自动退出取点态：鼠标不再改游标，两条线和 5 个周期保留。
+
+        想重新量一段，再点一次「时间游标」即可（会清空重来）。
+        """
+        self.tcursor_on = False
+        try:
+            self._set_on(self.btn_tcursor, False)
+        except Exception:
+            pass
+
+    # ---------------- 频差（频谱上的 A/B 双标线，量两条谱线的频率差） ----------------
+    _DIFF_PLOTS = ("fft", "envelope", "velocity", "order", "stft")
+
+    def _toggle_fcdiff(self):
+        """频差：打开后在谱图上点两次，分别吸附到最近的峰 A/B，标出 Δf。"""
+        if self.current_plot not in self._DIFF_PLOTS:
+            return
+        self.fcdiff_on = not getattr(self, "fcdiff_on", False)
+        self._set_on(getattr(self, "btn_fcdiff", None), self.fcdiff_on)
+        if self.fcdiff_on:
+            # 互斥：关掉其它点击模式，避免一次点击被两处消费
+            self._fc_t = []
+            self._fc_active = 0
+            self.annotate_mode = False
+            try:
+                self._set_on(self.btn_annotate, False)
+            except Exception:
+                pass
+            self.tcursor_on = False
+            try:
+                self._set_on(self.btn_tcursor, False)
+            except Exception:
+                pass
+        else:
+            self._fc_t = []
+        self._redraw_current_plot()
+
+    def _finish_fcdiff(self):
+        """A/B 都定好后自动退出取点态（两条线和 Δf 保留，再点按钮重来）。"""
+        self.fcdiff_on = False
+        try:
+            self._set_on(self.btn_fcdiff, False)
+        except Exception:
+            pass
+
+    def _snap_fcdiff(self, x, xpx=None, max_px=10):
+        """把点击位置吸附到**最近**的谱峰（±10 像素内），没有峰就保留原频率。
+
+        注意不能用“窗口内取最高峰”：谱图横轴跨度大时 10 像素相当于几十 Hz，
+        会把 100Hz 的点吸到 50Hz 的强峰上（Δf 看起来完全不对）。
+        """
+        try:
+            f = np.asarray(self._cur_f, dtype=float)
+            a = np.asarray(self._cur_amp, dtype=float)
+            if f.size < 5 or a.size != f.size:
+                return float(x)
+            ax = self.fig.gca()
+            cx = float(xpx) if xpx is not None else float(
+                ax.transData.transform((float(x), 0.0))[0])
+            pk, _ = find_peaks(a, height=float(np.max(a)) * 0.05)
+            if len(pk) == 0:
+                return float(x)
+            px = ax.transData.transform(np.column_stack([f[pk], np.zeros(len(pk))]))[:, 0]
+            d = np.abs(px - cx)
+            j = int(np.argmin(d))
+            if d[j] <= max_px:
+                return float(f[pk[j]])
+            return float(x)
+        except Exception:
+            return float(x)
+
+    def _draw_freq_cursor(self, ax):
+        """画频差的 A/B 两条竖线、峰顶圈和 Δf 读数。"""
+        if not getattr(self, "_fc_t", None):
+            return
+        if self.current_plot not in self._DIFF_PLOTS or self.marks_hidden:
+            return
+        cols = ("#1d4e89", "#c0392b")
+        names = ("A", "B")
+        try:
+            y0, y1 = ax.get_ylim()
+        except Exception:
+            return
+        for i, hz in enumerate(self._fc_t[:2]):
+            try:
+                ax.axvline(float(hz), color=cols[i], ls="--", lw=1.2, alpha=0.9, zorder=6)
+                amp = self._amp_at(float(hz))
+                if amp is None:
+                    amp = y0 + (y1 - y0) * 0.05
+                ax.plot(float(hz), float(amp), "o", ms=self.RING_MS, mfc="white",
+                        mec=cols[i], mew=self.RING_MEW, zorder=7)
+                # 两条线挨得近时 B 的标签抬一行，避免 A/B 文字叠在一起
+                _span = 1.0
+                try:
+                    _x0, _x1 = ax.get_xlim()
+                    _span = max(float(_x1) - float(_x0), 1e-9)
+                except Exception:
+                    pass
+                _ty = 0.035
+                if (i == 1 and len(self._fc_t) >= 2
+                        and abs(float(self._fc_t[1]) - float(self._fc_t[0])) < 0.16 * _span):
+                    _ty = 0.105
+                ax.text(float(hz), y0 + (y1 - y0) * _ty, "%s %.1fHz" % (names[i], float(hz)),
+                        ha="center", va="bottom", fontsize=7.4, color=cols[i], zorder=8,
+                        bbox=dict(boxstyle="round,pad=0.16", fc="white", ec="none", alpha=0.82))
+            except Exception:
+                continue
+        if len(self._fc_t) >= 2:
+            try:
+                d = abs(float(self._fc_t[1]) - float(self._fc_t[0]))
+                # 放在 overall RMS 信息框正下方（按 RMS 框行数让位）
+                _nl = 1
+                try:
+                    _nl += len(self._base_freq_marks()[:4])
+                except Exception:
+                    pass
+                _ty = max(0.05, 0.975 - 0.030 * _nl - 0.022)
+                ax.text(0.012, _ty, "\u0394f %.2fHz" % d, transform=ax.transAxes,
+                        ha="left", va="top", fontsize=7.8, fontweight="bold",
+                        color="#2b3d51", zorder=12)
+            except Exception:
+                pass
 
     def _fund_freq(self):
         # 基频频率（Hz）；非法输入按 0 处理，调用方据此判断是否已设定
@@ -3768,70 +5640,6 @@ class SpectrumWindow(tk.Toplevel):
         except (TypeError, ValueError):
             return 0.0
         return v if v > 0 else 0.0
-
-    def _fund_period(self):
-        # 由基频频率换算周期（时间轴单位 s）：T = 1/f
-        f = self._fund_freq()
-        return 1.0 / f if f > 0 else 0.0
-
-    def _onclick_single_line(self, event):
-        if self.axis_locked: return
-        if not getattr(self, "single_line_on", False) or event.inaxes is None: return
-        if event.button != 1 or event.xdata is None: return
-        self._single_start_t = self._snap_time_to_peak(event.xdata)
-        self.single_line_on = False
-        self._freq_confirmed = False
-        self._set_on(self.btn_single, False)
-        if getattr(self, "_single_relock", False):
-            self._auto_lock_pending = True
-        self._redraw_current_plot()
-
-    def _on_press_period(self, event):
-        """时域：在基频起点竖线附近按下，进入拖动周期标注状态。"""
-        if self.current_plot != "time" or self._single_start_t is None:
-            return
-        if event.button != 1 or event.inaxes is None or event.xdata is None:
-            return
-        try:
-            ax = self.fig.gca()
-            px = float(ax.transData.transform((event.xdata, 0.0))[0])
-            sx = float(ax.transData.transform((self._single_start_t, 0.0))[0])
-        except Exception:
-            return
-        if abs(px - sx) <= 12:
-            self._drag_period = True
-
-    def _on_motion_period(self, event):
-        if not getattr(self, "_drag_period", False):
-            return
-        if event.inaxes is None or event.xdata is None:
-            return
-        self._single_start_t = max(0.0, self._snap_time_to_peak(float(event.xdata)))
-        self._redraw_current_plot()
-
-    def _snap_time_to_peak(self, x):
-        """把时间 x 吸附到附近 ±10 像素内幅值最大的样点（自动找峰）。"""
-        t = getattr(self, "_snap_t", None)
-        sig = getattr(self, "_snap_sig", None)
-        if t is None or sig is None or len(t) < 3:
-            return x
-        try:
-            ax = self.fig.gca()
-            x0, x1 = ax.get_xlim()
-            wpx = max(float(ax.bbox.width), 1.0)
-            win = abs(float(x1) - float(x0)) * 10.0 / wpx
-        except Exception:
-            win = 0.01
-        win = max(win, 1e-9)
-        i0 = int(np.searchsorted(t, x - win))
-        i1 = int(np.searchsorted(t, x + win))
-        if i1 - i0 < 3:
-            return x
-        seg = np.abs(sig[i0:i1])
-        return float(t[i0 + int(np.argmax(seg))])
-
-    def _on_release_period(self, event):
-        self._drag_period = False
 
     def _place_autocorr_base(self):
         """自相关“基频”按钮：把标记放到转频周期（无转速时放视窗中心），不依赖鼠标点图。"""
@@ -3866,21 +5674,6 @@ class SpectrumWindow(tk.Toplevel):
         if self._single_start_t is None:
             self._single_start_t = 0.0
 
-    def _popup_freq(self):
-        # 时域“频率”：设定基频频率（Hz），标记按 1/f 的周期重复
-        if self._single_start_t is None:
-            messagebox.showinfo("提示", "请先点“基频”按钮，在时域图上选一个起点")
-            return
-        self._push_undo()
-        cur_hz = self._fund_freq() or 28.9
-        freq = simpledialog.askfloat(
-            "基频频率", "请输入基频频率（Hz）：",
-            initialvalue=cur_hz, minvalue=0.001, parent=self)
-        if freq and freq > 0:
-            self.var_single_freq.set(f"{freq:g}")
-            self._freq_confirmed = True
-            self._redraw_current_plot()
-
     def _onclick_mark_time(self, event):
         if self.axis_locked: return
         if not getattr(self, "mark_time_on", False) or event.inaxes is None: return
@@ -3888,6 +5681,84 @@ class SpectrumWindow(tk.Toplevel):
         if event.xdata is None: return
         self._manual_marks_time.append(round(event.xdata, 3))
         self._redraw_current_plot()
+
+    def _best_period_start(self, t, y, T, default=0.0):
+        """给 1T…5T 挑一个“幅值高、周期清楚”的起点。
+
+        1) 先按 5 个周期滑动，算每窗的周期性 r = corr(x(t), x(t+T))；
+        2) 在“周期性够好”（r ≥ 0.7×最大 r）的窗里，选幅值最大的一窗；
+           如果整段都没什么周期性（r 普遍很小），就退回纯幅值最大的窗；
+        3) 起点取该窗里最强波峰往前 2 个周期——周期块从冲击前开始，覆盖冲击及其重复段；
+        4) 最后在 ±0.25T 内吸附到最近的波峰，让红圈压在峰上。
+        """
+        try:
+            t = np.asarray(t, dtype=float)
+            x = np.asarray(y, dtype=float)
+            ax_ = np.abs(x)
+            T = float(T)
+            if t.size < 64 or not np.isfinite(T) or T <= 0:
+                return float(default)
+            span = float(t[-1] - t[0])
+            if span <= 1.5 * T:
+                return float(default)
+            dt = float(np.median(np.diff(t)))
+            if not np.isfinite(dt) or dt <= 0:
+                return float(default)
+            m = int(round(T / dt))
+            if m < 2:
+                return float(default)
+            win = 5 * m
+            step = max(1, m // 8)
+            if x.size < win + m:
+                return float(default)
+            xc = x - float(np.mean(x))
+            rows = []
+            for s in range(0, x.size - win - m + 1, step):
+                seg = xc[s:s + win]
+                a, b = seg[:-m], seg[m:]
+                den = float(np.sqrt(np.dot(a, a) * np.dot(b, b)))
+                r = float(np.dot(a, b)) / den if den > 0 else 0.0
+                e = float(np.mean(ax_[s:s + win]))
+                rows.append((max(0.0, r), e, s))
+            if not rows:
+                return float(default)
+            rmax = max(r for r, e, s in rows)
+            if rmax > 0.10:
+                good = [row for row in rows if row[0] >= 0.7 * rmax]
+            else:
+                good = rows
+            _, _, s = max(good, key=lambda row: row[1])
+            seg = ax_[s:s + win]
+            j = int(np.argmax(seg)) if seg.size else 0
+            a = float(t[min(s + j, t.size - 1)]) - 2.0 * T   # 从最强冲击前 2 个周期起
+            a = max(a, float(t[s]))
+            tol = 0.25 * T
+            mm = (t >= a - tol) & (t <= a + tol)
+            if np.any(mm):
+                tm = t[mm]
+                a = float(tm[int(np.argmax(ax_[mm]))])
+            return a
+        except Exception:
+            return float(default)
+
+    def _period_source(self):
+        """时域 1T…5T 用的周期来源：优先时间游标 A/B，其次自相关选出的基频。
+
+        返回 (起点秒, 周期秒, 频率Hz)；都没有时返回 (None, 0.0, 0.0)。
+        """
+        if len(getattr(self, "_tc_t", []) or []) == 2:
+            a, b = sorted(float(x) for x in self._tc_t)
+            if b - a > 1e-9:
+                return a, b - a, 1.0 / (b - a)
+            return None, 0.0, 0.0
+        try:
+            f0 = self._fund_freq()
+        except Exception:
+            f0 = 0.0
+        if (f0 > 0 and getattr(self, "_freq_confirmed", False)
+                and getattr(self, "_single_start_t", None) is not None):
+            return float(self._single_start_t), 1.0 / f0, f0
+        return None, 0.0, 0.0
 
     def plot_time(self):
         sig = self._get_sig()
@@ -3903,6 +5774,13 @@ class SpectrumWindow(tk.Toplevel):
             t_plot = t[mask]; sig_plot = sig[mask]
         else:
             t_plot = t; sig_plot = sig
+        # 时间游标吸附用：当前显示段的波形峰（|x| 的局部极大，阈值取段内最大值的 25%）
+        try:
+            _abs = np.abs(np.asarray(sig_plot, dtype=float))
+            _pk, _ = find_peaks(_abs, height=0.25 * float(_abs.max() or 1.0))
+            self._tc_peaks = np.asarray(t_plot, dtype=float)[_pk] if len(_pk) else None
+        except Exception:
+            self._tc_peaks = None
         ax.plot(*self._decimate_xy(t_plot, sig_plot), lw=0.5)
         ax.axhline(0, color="black", lw=0.8)
         # 纵轴按“当前显示段”的峰值取：细化后若仍用整段信号的峰值，局部波形会被压扁
@@ -3921,70 +5799,91 @@ class SpectrumWindow(tk.Toplevel):
                 _f = self._fund_freq()
                 _T = 1.0 / _f if _f > 0 else 0.0
                 if _T > 0:
-                    _t0 = float(self._single_start_t)
+                    # 起点不一定是 0：优先挑幅值最高、周期最清楚的那一段（例如 0.4–0.6s）
+                    _t0 = self._best_period_start(t_plot, sig_plot, _T,
+                                                  default=float(self._single_start_t))
+                    self._single_start_t = _t0
                     _lo = max(0.0, _t0 - 0.5 * _T)
                     _hi = min(float(t[-1]), _lo + 5.5 * _T)
                     if _hi - _lo >= 2.0 * _T:
                         ax.set_xlim(_lo, _hi)
                         self._autocorr_zoom_pending = False
+                        # 这只是“看 5 个周期”的临时视图；告诉缩小按钮完整视图仍是整段记录，
+                        # 否则 _post_draw 会把当前 0.27s 的视图记成 full，缩小按钮直接失效
+                        self._zoom_full_override = (0.0, float(t[-1]))
         # 手动标注的时间点
         for mt in ([] if self.marks_hidden else self._manual_marks_time):
             ax.axvline(mt, color="green", ls=":", lw=1.5)
             ax.text(mt, -m*0.9, f"{mt:.2f}s", color="green", fontsize=8, ha="center")
-        # 基频标记：起点竖线 + 按基频周期（1/f）重复的标记线/填充，用于目视核对整周期
-        if self._single_start_t is not None and not self.marks_hidden:
-            t0 = float(self._single_start_t)
-            f_hz = self._fund_freq()
-            T = 1.0 / f_hz if f_hz > 0 else 0.0
-            confirmed = bool(getattr(self, "_freq_confirmed", False)) and T > 0
-            ax.axvline(t0, color="#2f66a3", ls="--", lw=1.4, alpha=0.9, zorder=4)
-            # 起点处空心红圈：与频域标识保持同一视觉语言
-            if t[0] <= t0 <= t[-1]:
+        # 时间游标：A/B 两条竖线 + Δt 与 1/Δt（=该间隔对应的频率）
+        # 注意：是否显示只看有没有游标，不看取点态——A/B 定完后会自动退出取点态，
+        # 若这里再要求 tcursor_on，刚定的两条线会整块消失。
+        if self._tc_t and not self.marks_hidden:
+            _cols = ("#1d4e89", "#c0392b")
+            _names = ("A", "B")
+            for _i, _tt in enumerate(self._tc_t):
+                _tt = float(_tt)
+                if _tt < float(t[0]) or _tt > float(t[-1]):
+                    continue
+                ax.axvline(_tt, color=_cols[_i], ls="--", lw=1.3, alpha=0.95, zorder=4)
+                # 游标落点画空心红圈（与倍频/周期分界同一视觉语言），表示吸附到的波形峰
                 try:
-                    i0s = int(np.argmin(np.abs(t - t0)))
-                    ax.plot(t0, float(sig[i0s]), "o", ms=self.RING_MS, mfc="white",
+                    _ic = int(np.argmin(np.abs(t - _tt)))
+                    ax.plot(_tt, float(sig[_ic]), "o", ms=self.RING_MS, mfc="white",
                             mec="red", mew=self.RING_MEW, zorder=6)
                 except Exception:
                     pass
-            label = f"f={f_hz:.2f}Hz" if confirmed else "基频起点（待设频率）"
-            if not confirmed:
-                ax.annotate(label, xy=(t0, m * 0.90), xytext=(8, 0), textcoords="offset points",
-                            color="#1d4e89", fontsize=9, ha="left", va="center", zorder=7,
-                            annotation_clip=True,
-                            bbox=dict(boxstyle="round,pad=0.24", fc="white", ec="#2f66a3", alpha=0.94, lw=0.8),
-                            arrowprops=dict(arrowstyle="-", color="#2f66a3", lw=0.7, shrinkA=0, shrinkB=2))
-            if confirmed:
-                t_end = float(t[-1])
-                for k in range(1, 6):
-                    tk = t0 + k * T
-                    lo, hi = t0 + (k - 1) * T, tk
-                    if hi < t[0] or lo > t_end * 1.001:
-                        continue  # 细化到窗口外时整段跳过，避免文字/填充跑到图外
-                    # 每个周期与带宽同款：黄色填充 + 深琥珀色斜线
-                    ax.axvspan(max(lo, t[0]), min(hi, t_end), facecolor=self.BW_COLOR,
+                # A 标签贴线左侧、B 贴线右侧：两条挨得近时也不会叠在一起
+                _off = 0.004 * max(float(t[-1]) - float(t[0]), 1e-9)
+                _tx = _tt - _off if _i == 0 else _tt + _off
+                _ha = "right" if _i == 0 else "left"
+                ax.text(_tx, -m * 0.90, "%s %.3fs" % (_names[_i], _tt), color=_cols[_i],
+                        fontsize=8, ha=_ha, va="bottom", zorder=9, clip_on=True,
+                        bbox=dict(boxstyle="round,pad=0.16", fc="white",
+                                  ec=_cols[_i], alpha=0.9))
+            if len(self._tc_t) == 2:
+                _t1, _t2 = sorted(float(x) for x in self._tc_t)
+                ax.axvspan(_t1, _t2, facecolor=_cols[0], alpha=0.06, zorder=0)
+                # Δt 与 1/Δt 只在右上角那条 1T 汇总里给，避免和它重复成两块信息
+        # 周期来源：优先时间游标 A/B；没有游标时退回“基频/自相关周期”，
+        # 这样在自相关上选好周期后切到时域，仍能看到 1T…5T
+        _p0, _T, _fhz = self._period_source()
+        if _p0 is not None and _T > 1e-9 and not self.marks_hidden:
+            if True:
+                _fhz = 1.0 / _T
+                _tend = float(t[-1])
+                for _k in range(1, 6):
+                    _tk = _p0 + _k * _T
+                    _lo, _hi = _p0 + (_k - 1) * _T, _tk
+                    if _hi < float(t[0]) or _lo > _tend * 1.001:
+                        continue
+                    ax.axvspan(max(_lo, float(t[0])), min(_hi, _tend), facecolor=self.BW_COLOR,
                                alpha=0.28, hatch="///", edgecolor="#8a5a00",
                                linewidth=0.6, zorder=0)
-                    # 周期分界：深琥珀色虚线，一直延伸到图顶
-                    ax.axvline(hi, color="#8a5a00", ls=(0, (4, 3)), lw=1.0,
-                               alpha=0.9, zorder=1)
-                    # 每个周期分界（1T/2T…）也在波形上画空心红圈
-                    if t[0] <= hi <= t_end:
+                    ax.axvline(_hi, color="#8a5a00", ls=(0, (4, 3)), lw=1.0, alpha=0.9, zorder=1)
+                    if float(t[0]) <= _hi <= _tend:
                         try:
-                            ih = int(np.argmin(np.abs(t - hi)))
-                            ax.plot(hi, float(sig[ih]), "o", ms=self.RING_MS,
+                            _ih = int(np.argmin(np.abs(t - _hi)))
+                            ax.plot(_hi, float(sig[_ih]), "o", ms=self.RING_MS,
                                     mfc="white", mec="red", mew=self.RING_MEW, zorder=6)
                         except Exception:
                             pass
-                ax.plot(t0, m * 1.0, marker="^", color="#2f66a3", markersize=8, zorder=5)
-                ax.plot(t0 + T, m * 1.0, marker="v", color="#8a5a00", markersize=8, zorder=5)
-                t_end = float(t[-1])
-                # 右上角只显示第 1 个周期：开始/结束/间隔/频率（无边框）
-                hi1 = min(t0 + T, t_end)
-                txt = (f"1T  开始 {t0:.3f}s  结束 {hi1:.3f}s  "
-                       f"间隔 {T:.4f}s  频率 {f_hz:.2f}Hz")
-                ax.text(0.985, 0.975, txt, transform=ax.transAxes,
-                        ha="right", va="top", zorder=8, clip_on=False,
-                        fontsize=7.6, family="SimSun", color="#2b3d51")
+                # 起点也画一个空心红圈（和 1T…5T 的分界圈同一风格），一眼能看出周期从哪开始
+                if float(t[0]) <= _p0 <= _tend:
+                    try:
+                        _i0 = int(np.argmin(np.abs(t - _p0)))
+                        ax.plot(_p0, float(sig[_i0]), "o", ms=self.RING_MS,
+                                mfc="white", mec="red", mew=self.RING_MEW, zorder=6)
+                    except Exception:
+                        pass
+                ax.plot(_p0, m * 1.0, marker="^", color="#2f66a3", markersize=8, zorder=5)
+                ax.plot(_p0 + _T, m * 1.0, marker="v", color="#8a5a00", markersize=8, zorder=5)
+                _h1 = min(_p0 + _T, _tend)
+                ax.text(0.985, 0.975,
+                        "1T  开始 %.3fs  结束 %.3fs  间隔 %.4fs  频率 %.2fHz"
+                        % (_p0, _h1, _T, _fhz),
+                        transform=ax.transAxes, ha="right", va="top", zorder=8,
+                        clip_on=False, fontsize=7.6, color="#2b3d51")
         self._post_draw()
 
     def plot_autocorr(self):
@@ -4130,6 +6029,7 @@ class SpectrumWindow(tk.Toplevel):
                         chosen_px.append(px)
                     if len(chosen) >= 4: break
                 top = sorted(chosen, key=lambda i: tau_view[i])
+                _labeled_hz = []
                 for pi in top:
                     # 抛物线插值提高峰位置精度
                     if 0 < pi < len(ac_view)-1:
@@ -4140,7 +6040,12 @@ class SpectrumWindow(tk.Toplevel):
                         t_val = tau_view[pi] + delta * (tau_view[1] - tau_view[0])
                     else:
                         t_val = tau_view[pi]
-                    ac_val = ac_view[pi]; f_imp = 1.0 / t_val
+                    ac_val = ac_view[pi]
+                    # 频率不用裸 1/τ：先锚到谱峰定支，再用多周期细化（见 _autocorr_label_freq）
+                    f_imp = self._autocorr_label_freq(t_val, tau_view, ac_view)
+                    if any(abs(f_imp - _x) < 0.005 * f_imp for _x in _labeled_hz):
+                        continue
+                    _labeled_hz.append(f_imp)
                     ax.plot(t_val, ac_val, "ro", ms=3, mfc="white", mec="red", mew=1.2)
                     ax.annotate(f"{f_imp:.1f}Hz", xy=(t_val, ac_val),
                                 xytext=(t_val, ac_val + 0.08),
@@ -4182,6 +6087,11 @@ class SpectrumWindow(tk.Toplevel):
 
     def _fft_view(self, nyq):
         """FFT/速度谱的默认显示范围：带通打开时只显示该频段，否则 0~有效分析上限。"""
+        if getattr(self, "_zoom_hi", None):
+            try:
+                return self._view_for(0.0, min(float(nyq), float(self._zoom_hi)))
+            except Exception:
+                pass
         v0, v1 = 0.0, float(nyq)
         if self.var_bp.get():
             try:
@@ -4263,9 +6173,14 @@ class SpectrumWindow(tk.Toplevel):
             try:
                 lo = float(self.var_bp_low.get()); hi = float(self.var_bp_high.get())
                 ax.set_xlim(max(0, lo), hi)
-            except: pass
+            except Exception: pass
         elif self.refine_range is None:
             ax.set_xlim(-nyq * 0.02, nyq)
+        if self.refine_range is None and getattr(self, "_zoom_hi", None):
+            try:
+                ax.set_xlim(0.0, min(float(self._zoom_hi), nyq))
+            except Exception:
+                pass
         ax.set_ylim(bottom=0); ax.set_xlabel("频率(Hz)"); ax.set_ylabel("Amplitude (m/s$^2$)")
         self._post_draw()
 
@@ -4300,18 +6215,26 @@ class SpectrumWindow(tk.Toplevel):
             cached = (f, amp)
             cache[key] = cached
         f, amp = cached
-        m = f <= hi
+        # 数据保留到 fs/2.56（而不是只到包络显示上限 hi），这样「缩小」才能把
+        # 最高分析频率从带通上限一路扩到 fs/2.56；峰值标注仍只在带内做，避免满屏噪声峰
+        _fmax = min(float(f_disp), float(f[-1]))
+        m_all = f <= _fmax
+        m_band = m_all & (f <= hi)
         ax = self._fresh_ax("包络谱")
-        ax.plot(*self._decimate_xy(f[m], amp[m], view=self._view_for(0.0, float(hi))), lw=0.8)
-        ax.set_ylim(0, max(float(np.max(amp[m])), 1e-12) * 1.05)
-        self._cur_f = f[m]; self._cur_amp = amp[m]
-        rpm = self.info.get("speed")
-        if rpm:
-            pass
-        self._peak_annotate(ax, f[m], amp[m])
+        _view_hi = min(float(hi), _fmax)
+        if getattr(self, "_zoom_hi", None):
+            _view_hi = min(max(_view_hi, float(self._zoom_hi)), _fmax)
+        ax.plot(*self._decimate_xy(f[m_all], amp[m_all],
+                                   view=self._view_for(0.0, _view_hi)), lw=0.8)
+        ax.set_ylim(0, max(float(np.max(amp[m_band])), 1e-12) * 1.05)
+        self._cur_f = f[m_all]; self._cur_amp = amp[m_all]
+        self._peak_annotate(ax, f[m_band], amp[m_band])
         ax.set_ylim(bottom=0); ax.set_xlabel("包络频率(Hz)"); ax.set_ylabel("Amplitude (m/s$^2$)")
-        # X 轴只显示到最大分析频率（包络带通上限 hi），不保留 autoscale 的右侧余量
-        ax.set_xlim(0, hi)
+        # X 轴默认只显示到包络上限 hi；「缩小」扩展到 fs/2.56 后按扩展上界显示
+        _xh = min(float(hi), _fmax)
+        if self.refine_range is None and getattr(self, "_zoom_hi", None):
+            _xh = min(float(self._zoom_hi), _fmax)
+        ax.set_xlim(0, _xh)
         self._post_draw()
 
     def _get_rot_hz(self):
@@ -4461,7 +6384,7 @@ class SpectrumWindow(tk.Toplevel):
         # 倒频谱有正有负：给出上下 8% 余量，让负峰完整可见（_post_draw 不再强制 ylim 下限为 0）
         ax.margins(y=0.08)
         self._cur_f = q[mask]; self._cur_amp = cep[mask]
-        self._peak_annotate(ax, q[mask], cep[mask], unit="s")
+        self._peak_annotate(ax, q[mask], cep[mask], unit="s", as_freq=True)
         ax.set_xlabel("Quefrency (s)"); ax.set_ylabel("Cepstrum")
         self._post_draw()
 
@@ -4498,9 +6421,14 @@ class SpectrumWindow(tk.Toplevel):
             try:
                 lo = float(self.var_bp_low.get()); hi = float(self.var_bp_high.get())
                 ax.set_xlim(max(0, lo), hi)
-            except: pass
+            except Exception: pass
         elif self.refine_range is None:
             ax.set_xlim(-nyq * 0.02, nyq)
+        if self.refine_range is None and getattr(self, "_zoom_hi", None):
+            try:
+                ax.set_xlim(0.0, min(float(self._zoom_hi), nyq))
+            except Exception:
+                pass
         ax.set_xlabel("频率(Hz)"); ax.set_ylabel("Velocity (mm/s)")
         self._post_draw()
 
@@ -4529,17 +6457,30 @@ class SpectrumWindow(tk.Toplevel):
 
     def _refine_peak_hz(self, f0, half):
         """在 f0±half 内用全记录 FFT 找更精确的峰频率：取窗口内幅值最大的那条谱线。
+
         与其它谱图显示的“谱线中心”口径一致（25600Hz/131072 点时谱线宽 0.195Hz），
-        不用抛物线插值——矩形窗下插值反而会偏 0.05~0.1Hz，和速度谱对不上。"""
+        不用抛物线插值——矩形窗下插值反而会偏 0.05~0.1Hz，和速度谱对不上。
+
+        搜索窗实际取 1.5 倍 half：瀑布的 STFT 谱线宽 12.5Hz（2048 点），19.13Hz 的 1X
+        可能落在 12.5 或 25.0 那条线上，只给 ±半线宽会把真峰漏在窗外，出现
+        “瀑布 18.7Hz、速度谱 19.1Hz”的错觉。
+        """
         try:
             f, amp = self._full_fft_for_refine()
-            lo = max(0.0, float(f0) - float(half))
-            hi = float(f0) + float(half)
+            span = abs(float(half)) * 1.5
+            lo = max(0.0, float(f0) - span)
+            hi = float(f0) + span
             idx = np.where((f >= lo) & (f <= hi))[0]
             idx = idx[idx > 0]                 # 跳过直流分量，否则低端峰会被细化到 0Hz
             if idx.size == 0:
                 return float(f0)
-            k = int(idx[int(np.argmax(amp[idx]))])
+            # 幅值 × 距离权重（高斯，σ=span）：既偏向真峰，又不会甩开原谱线跳到隔壁的 2X
+            w = np.exp(-(((f[idx] - float(f0)) / max(span, 1e-9)) ** 2))
+            k = int(idx[int(np.argmax(amp[idx] * w))])
+            # 细化结果必须确实比原谱线处更强，否则保持原值（防止跳到噪声）
+            i0 = int(np.argmin(np.abs(f - float(f0))))
+            if float(amp[k]) < float(amp[i0]):
+                return float(f0)
             return float(f[k])
         except Exception:
             return float(f0)
@@ -4636,11 +6577,13 @@ class SpectrumWindow(tk.Toplevel):
                     alpha=0.95, zorder=2 + k)
         top = base0 + (len(idx) - 1) * step + 0.95
         ax.set_xlim(0.0, x_hi)
-        # 栈顶之上留 1.2 个帧距，专门给“主频标注”用，避免文字压在最上层曲线上
-        ax.set_ylim(0.0, top + 1.2)
+        # 栈顶之上留出一段空白：左上角的 overall RMS 信息写在这里，不压最上层曲线
+        # （主频标签已移到坐标区外，不再占用这段空间）
+        ax.set_ylim(0.0, top + 3.0)
         ax.set_yticks([])
         ax.tick_params(axis="y", left=False)
-        ax.set_xlabel("频率(Hz)")
+        _df_bin = float(self.fs) / float(nperseg) if nperseg else 0.0
+        ax.set_xlabel("频率(Hz)" + ("   谱线宽 %.1f Hz" % _df_bin if _df_bin > 0 else ""))
         ax.set_ylabel("时间（自下而上）")
         # 标题只保留“瀑布图-测点 / 采集时间+转速+转频”两行，不再显示分段与帧数
         # 时间色标：颜色由深到亮对应时间先后
@@ -4684,7 +6627,9 @@ class SpectrumWindow(tk.Toplevel):
                 ax.axvline(f_lbl, color="#b8860b", ls="--", lw=0.9, alpha=0.75, zorder=1)
                 label = (f"{f_lbl:.1f}Hz ({f_lbl / f_rot:.1f}X)" if f_rot > 0
                          else f"{f_lbl:.1f}Hz")
-                ax.annotate(label, xy=(f_lbl, top + 0.10), xycoords="data",
+                # 标签画在坐标区上方（y>1.0），不占坐标区内部——
+                # 内部左上角留给 overall RMS 信息，原来两者叠在一起
+                ax.annotate(label, xy=(f_lbl, 1.010), xycoords=ax.get_xaxis_transform(),
                             xytext=(0, 0), textcoords="offset points",
                             fontsize=7.5, color="#8a6d00", ha="center", va="bottom",
                             zorder=9, clip_on=False,
@@ -5136,52 +7081,81 @@ def report_stats(rows, vdi_only_normal=True):
     return agg
 
 
+# 齿轮边带严重度口径：边带/主峰 ≥0.30 警告、≥0.12 关注（经验值，报告与谱图卡片共用）
+GEAR_WARN_RATIO = 0.30
+GEAR_WATCH_RATIO = 0.12
+
 # ----------------- 包络谱故障判定（报告用） -----------------
 DATA_BAD_RATIO = 0.05        # 低于同型中位的 5% 判“数据异常”（传感器/采集通道）
-ENV_FAULT_AMP_MIN = 3.0      # 包络谱故障阶次最小幅值
-ENV_FAULT_REL = 5.0          # 相对同型测点中位数的倍数
-
-
-def _shaft_freqs(rpm):
-    """由发电机(高速轴)转速换算出各轴转频(Hz)。"""
-    fH = float(rpm) / 60.0
-    fM = fH / GB_I3
-    fS = fM / GB_I2
-    fL = fS / GB_I1
-    return {"H": fH, "M": fM, "S": fS, "L": fL, "P": fL * GB_ZR / GB_ZP}
+ENV_FAULT_AMP_FLOOR = 0.20   # 包络谱故障阶次绝对下限（实测正常点中位 0.075、P90 约 0.25）
+ENV_FAULT_AMP_MIN = ENV_FAULT_AMP_FLOOR   # 兼容旧名（曾被写成 3.0，比实测最大值还高）
+ENV_FAULT_REL = 5.0          # 相对同型测点（跨机组）中位数的倍数
+ENV_SCAN_FILES = 5           # 每个测点回看最近几条记录（用于判断“是否复现”）
+ENV_MIN_HITS = 2             # 同一轴承同一阶次至少复现几次才升“警告”
 
 
 def report_bearing_names(project, point):
-    """按项目与测点名解析出可能的轴承（下划线不敏感的子串匹配）。"""
-    mapping = None
-    for pk, pm in BEARING_PROJECT_MAP.items():
-        if pk and pk in str(project):
-            mapping = pm
-            break
-    if not mapping:
+    """按项目与测点名解析出可能的轴承（下划线不敏感的子串匹配）；机型来自 数据\机型库.json。"""
+    prof = profile_for_project(project)
+    if not prof:
         return []
     pt = str(point).replace("_", "")
-    for kw, blist in mapping:
+    for kw, blist in prof.get("points") or []:
         if kw and kw.replace("_", "") in pt:
             return list(blist)
     return []
 
 
+def report_demod_band(fs):
+    """包络解调带（Hz）：固定 1000–8000Hz，采样率高时封顶在 0.95×Nyquist。
+
+    报告里要把这个范围写进“判读依据”，所以和 report_env_curve 共用同一处定义。
+    """
+    try:
+        fs = float(fs)
+    except (TypeError, ValueError):
+        return 1000.0, 8000.0
+    lo = 1000.0
+    hi = min(8000.0, fs / 2.0 * 0.95)
+    if hi <= lo * 1.2:
+        lo = 400.0
+    return lo, hi
+
+
+def report_evidence_text(fs=None, demod=None, thr=None, ts=""):
+    """“判读依据”后缀：数据时间、采样率、解调带、判定阈值。"""
+    parts = []
+    if ts:
+        parts.append("数据 %s" % str(ts)[:16])
+    if fs:
+        try:
+            parts.append("fs %gHz" % float(fs))
+        except (TypeError, ValueError):
+            pass
+    if demod:
+        try:
+            parts.append("解调 %.0f–%.0fHz" % (float(demod[0]), float(demod[1])))
+        except (TypeError, ValueError, IndexError):
+            pass
+    if thr:
+        try:
+            parts.append("阈值 %.2f" % float(thr))
+        except (TypeError, ValueError):
+            pass
+    return ("（判读依据：%s）" % "，".join(parts)) if parts else ""
+
+
 def report_env_curve(csv_path, nrows=131072):
-    """包络谱曲线（用于绘图）：返回 (f, amp)。解调带 1000–8000Hz。"""
+    """包络谱曲线（用于绘图）：返回 (f, amp)。解调带见 report_demod_band。"""
     try:
         info = parse_filename(os.path.basename(csv_path)) or {}
         fs = info.get("fs")
         if not fs:
             return None, None
-        sig = pd.read_csv(csv_path, header=None, nrows=nrows).iloc[:, 0]
-        sig = pd.to_numeric(sig, errors="coerce").dropna().values.astype(float)
+        sig, _ = read_signal_csv(csv_path, nrows=nrows)
         if len(sig) < fs * 0.25:
             return None, None
-        lo = 1000.0
-        hi = min(8000.0, fs / 2.0 * 0.95)
-        if hi <= lo * 1.2:
-            lo, hi = 400.0, hi
+        lo, hi = report_demod_band(fs)
         filt = sosfiltfilt(design_band(fs, lo, hi, sos=True), sig)
         env = np.abs(hilbert(filt))
         env = env - np.mean(env)
@@ -5191,6 +7165,44 @@ def report_env_curve(csv_path, nrows=131072):
         return f, amp
     except Exception:
         return None, None
+
+
+def fault_freq_conflict(f_hz, rpm, profile, point=""):
+    """命中频率是否与 1X/2X/3X 转频或齿轮啮合频率重合（±2%）。
+
+    包络谱里，转频谐波和啮合频率本身也会起峰；不排除的话，
+    这些“正常成分”会被误认成轴承阶次。返回冲突说明（空串=不冲突）。
+    """
+    try:
+        f_hz = float(f_hz or 0.0)
+        rpm = float(rpm or 0.0)
+    except (TypeError, ValueError):
+        return ""
+    if f_hz <= 0 or rpm <= 0:
+        return ""
+    f_rot = rpm / 60.0
+    if f_rot <= 0:
+        return ""
+    for k in (1, 2, 3):
+        if abs(f_hz - k * f_rot) <= 0.02 * k * f_rot:
+            return "%dX转频" % k
+    try:
+        sh = shaft_freqs(rpm, profile)
+    except Exception:
+        sh = {"H": f_rot}
+    for g in ((profile or {}).get("gears") or [])[:6]:
+        try:
+            base = float(sh.get(g.get("shaft"), 0.0) or 0.0)
+            teeth = float(g.get("teeth") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if base <= 0 or teeth <= 0:
+            continue
+        mesh = teeth * base
+        for k in (1, 2):
+            if abs(f_hz - k * mesh) <= 0.02 * k * mesh:
+                return "%s啮合×%d" % (g.get("name") or "齿轮", k)
+    return ""
 
 
 def report_env_peak(csv_path, point, project):
@@ -5206,35 +7218,31 @@ def report_env_peak(csv_path, point, project):
         f, amp = report_env_curve(csv_path)
         if f is None:
             return None
-        sh = _shaft_freqs(rpm)
-        best = None
-        for nm in names:
-            brg = BEARING_LIB.get(nm)
-            if not brg:
-                continue
-            code, mult = brg
-            base = sh.get(code, 0.0)
-            if base <= 0:
-                continue
-            for key in ("BPFO", "BPFI", "BSF"):
-                m_ord = mult.get(key)
-                if not m_ord:
-                    continue
-                tgt = m_ord * base                       # 只认基频峰
-                if tgt <= 0 or tgt > f[-1]:
-                    continue
-                band = (f > tgt * 0.97) & (f < tgt * 1.03)
-                if not band.any():
-                    continue
-                a = float(amp[band].max())
-                # 2 倍频幅值：真正的轴承损伤通常有谐波族，宽带噪声没有
-                t2 = tgt * 2.0
-                b2 = (f > t2 * 0.97) & (f < t2 * 1.03)
-                a2 = float(amp[b2].max()) if (t2 <= f[-1] and b2.any()) else 0.0
-                if best is None or a > best["amp"]:
-                    best = {"amp": a, "amp2": a2, "hz": tgt, "label": "%s×1" % key,
-                            "bearing": nm, "order": m_ord}
-        return best
+        sh = shaft_freqs(rpm, profile_for_project(project))
+        best = bearing_family_match(f, amp, sh, names)
+        if not best:
+            return None
+        try:
+            order = float(BEARING_LIB[best["bearing"]][1].get(best["key"]) or 0.0)
+        except Exception:
+            order = 0.0
+        out = {"amp": best["amp"], "amp2": best["amp2"], "hz": best["hz"],
+               "label": "%s×1" % best["key"], "bearing": best["bearing"],
+               "order": order, "family_hits": best["hits"],
+               "dev": best["dev"], "ambiguous": best["ambiguous"],
+               # 证据强度：只命中 1× 的记为“弱证据”，不能凭它报警告
+               "weak": int(best["hits"] or 0) < 2,
+               # 与转频谐波/齿轮啮合频率重合的，也可能只是正常成分
+               "conflict": fault_freq_conflict(best["hz"], rpm,
+                                               profile_for_project(project), point),
+               # 判读依据：采样率与解调带，写进报告便于复现
+               "fs": float(fs), "demod": report_demod_band(fs)}
+        again = [x for x in best.get("all") or []
+                 if (x["bearing"], x["key"]) != (best["bearing"], best["key"])
+                 and x["score"] >= 0.85 * best["score"]][:1]
+        if again:
+            out["runner"] = "%s %s" % (again[0]["bearing"], again[0]["key"])
+        return out
     except Exception:
         return None
 
@@ -5242,8 +7250,169 @@ def report_env_peak(csv_path, point, project):
 REPORT_SCAN_STAT = {}
 
 
-def report_scan_faults(agg, rows, project):
-    """对每个测点做包络谱判定，写回 agg 等级并返回 {(机组,测点): 故障信息}。"""
+def report_gear_scan(csv_path, point, project):
+    """报告用的齿轮啮合判读：挑谱上最明显的一级，量边带间隔并指认。
+
+    返回 {stage, mesh, spacing, match, ratio, level, amp, score, peaks}；找不到返回 None。
+    level：正常 / 关注（边带/主峰≥0.12 且间隔对得上）/ 警告（≥0.30）。
+    """
+    try:
+        info = parse_filename(os.path.basename(csv_path)) or {}
+        fs, rpm = info.get("fs"), info.get("speed")
+        prof = profile_for_project(project)
+        gears = (prof or {}).get("gears") or []
+        if not fs or not rpm or not gears:
+            return None
+        sig, _ = read_signal_csv(csv_path, nrows=262144)
+        if sig.size < 4096:
+            return None
+        n = sig.size
+        amp = (2.0 / n) * np.abs(np.fft.rfft(sig * np.hanning(n)))
+        f = np.fft.rfftfreq(n, 1.0 / fs)
+        sh = shaft_freqs(rpm, prof)
+        best = None
+        for g in gears[:5]:
+            base = float(sh.get(g.get("shaft"), 0.0) or 0.0)
+            if base <= 0:
+                continue
+            mesh = float(g["teeth"]) * base
+            if mesh < 12 or mesh > float(f[-1]) * 0.9:
+                continue
+            band = (f > mesh * 0.98) & (f < mesh * 1.02)
+            if not band.any():
+                continue
+            a_mesh = float(amp[band].max())
+            nb = (f > mesh * 0.6) & (f < mesh * 1.4) & (~band)
+            a_ref = float(np.median(amp[nb])) if nb.any() else 0.0
+            score = a_mesh / max(a_ref, 1e-12)
+            if best is None or score > best["score"]:
+                best = {"stage": g.get("name", ""), "g": g, "mesh": mesh,
+                        "score": score, "amp": a_mesh}
+        if not best:
+            return None
+        g = best["g"]
+        cands = []
+        for code, cn in (("H", "高速轴"), ("M", "中速轴"), ("S", "低速轴"),
+                         ("L", "行星架"), ("P", "行星轮")):
+            if sh.get(code, 0) > 0:
+                cands.append((cn + "转频", float(sh[code])))
+        n_gcd = int(g.get("gcd") or 0)
+        if n_gcd >= 2:
+            cands.append(("GMF/%d" % n_gcd, best["mesh"] / n_gcd))
+        n_pl = int(g.get("planets") or 0)
+        if n_pl >= 2:
+            cands.append(("GMF/%d" % n_pl, best["mesh"] / n_pl))
+            if sh.get("S", 0) > 0:
+                cands.append(("%d×太阳轮" % n_pl, n_pl * float(sh["S"])))
+        v = gear_sideband_verdict(f, amp, best["mesh"], cands)
+        ratio = float(v.get("ratio") or 0.0)
+        level = "正常"
+        if v.get("match"):
+            level = ("警告" if ratio >= GEAR_WARN_RATIO
+                     else ("关注" if ratio >= GEAR_WATCH_RATIO else "正常"))
+        # 频谱形态 → 疑似故障类型（同一份谱线，不必再读文件）
+        mode, mode_score, mode_why = "", 0.0, []
+        try:
+            ev = spectrum_evidence(f, amp, prof, (float(rpm) or 0.0) / 60.0, sig=sig)
+            modes = fault_modes(ev, point=point)
+            if modes:
+                mode, mode_score, mode_why = modes[0]
+        except Exception:
+            pass
+        return {"stage": best["stage"], "mesh": float(best["mesh"]),
+                "score": float(best["score"]), "amp": float(best["amp"]),
+                "spacing": float(v.get("spacing") or 0.0), "match": v.get("match"),
+                "match_hz": float(v.get("match_hz") or 0.0),
+                "ratio": ratio, "level": level, "hits": len(v.get("hits") or []),
+                "mode": mode, "mode_score": float(mode_score), "mode_why": mode_why[:3]}
+    except Exception:
+        return None
+
+
+def report_gear_label(g):
+    """把 report_gear_scan 的结论压成一句话（报告正文用）。"""
+    if not g:
+        return ""
+    if g.get("match"):
+        txt = ("GMF %.1fHz 两侧边带间隔 %.2fHz（≈%s），边带/主峰 %.2f"
+               % (g["mesh"], g.get("spacing") or 0.0, g["match"], g.get("ratio") or 0.0))
+    else:
+        txt = "GMF %.1fHz 两侧边带间隔 %.2fHz（未对上轴转频/GMF÷n）" % (
+            g["mesh"], g.get("spacing") or 0.0)
+    if g.get("mode"):
+        txt += "；疑似 %s（%.0f%%）" % (g["mode"], (g.get("mode_score") or 0.0) * 100.0)
+    return txt
+
+
+SCAN_CACHE_FILE = "vib_scan_cache.json"   # 报告故障扫描缓存（项目目录，按文件 mtime+大小失效）
+
+
+def _scan_cache_load(path):
+    """读扫描缓存：[{abs csv|point: {mtime, size, env, gear}}]；坏文件按空处理。"""
+    try:
+        with open(path, encoding="utf-8-sig") as fp:
+            doc = json.load(fp)
+        ent = doc.get("entries") if isinstance(doc, dict) else None
+        return ent if isinstance(ent, dict) else {}
+    except Exception:
+        return {}
+
+
+def _scan_cache_save(path, cache):
+    """写回缓存，顺手丢掉已删除文件对应的条目。"""
+    try:
+        live = {k: v for k, v in cache.items() if os.path.exists(str(k).split("|")[0])}
+        with open(path, "w", encoding="utf-8", newline="\n") as fp:
+            json.dump({"version": 1, "entries": live}, fp, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def _scan_file(csv_path, point, project, cache, want_gear=False):
+    """单文件判读（带缓存）：返回 (env 结果, gear 结果, 是否命中缓存)。
+
+    缓存键 = 绝对路径|测点，失效条件 = 文件 mtime/size 变化；这样新增月份数据、
+    重算过某条记录，都只会重扫那几个文件。
+    """
+    try:
+        st = os.stat(csv_path)
+        sig = (float(st.st_mtime), int(st.st_size))
+    except OSError:
+        sig = None
+    key = "%s|%s" % (os.path.abspath(csv_path), point)
+    ent = None
+    if cache is not None and sig:
+        ent = cache.get(key)
+        if isinstance(ent, dict) and (ent.get("mtime") != sig[0] or ent.get("size") != sig[1]):
+            ent = None
+    if ent is not None and (not want_gear or "gear" in ent):
+        return ent.get("env"), ent.get("gear"), True
+    if ent is not None:                       # 已有包络，只补齿轮
+        gear = report_gear_scan(csv_path, point, project)
+        ent["gear"] = gear
+        return ent.get("env"), gear, False
+    env = report_env_peak(csv_path, point, project)
+    gear = report_gear_scan(csv_path, point, project) if want_gear else None
+    if cache is not None and sig:
+        item = {"mtime": sig[0], "size": sig[1], "env": env}
+        if want_gear:
+            item["gear"] = gear
+        cache[key] = item
+    return env, gear, False
+
+
+def report_scan_faults(agg, rows, project, cache_path=None, progress=None):
+    """对每个测点做包络谱 + 齿轮判读，写回 agg 等级并返回 {(机组,测点): 故障信息}。
+
+    判定口径（2026-11 重新标定）：
+      · 每个测点看**最近 ENV_SCAN_FILES 条**记录的包络谱，不再只看幅值最大的 1~2 条；
+      · 同一轴承同一阶次要**多次复现**（≥ ENV_MIN_HITS）才升“警告”，
+        只出现一次的大峰值最多给“关注”——单次冲击不再直接判故障；
+      · 幅值取命中记录的中位数，不用最大值（最大值天然偏高）；
+      · 阈值 = max(ENV_FAULT_AMP_FLOOR, ENV_FAULT_REL × 同测点跨机组中位数)；
+        同测点少于 3 个机组时只用绝对下限，避免“自己比自己”永远报不出来。
+    """
     fault_info = {}
     _n_pt = 0
     _n_miss = 0
@@ -5264,43 +7433,113 @@ def report_scan_faults(agg, rows, project):
             _ge = float(r.get("ge") or 0.0)
         except Exception:
             _ge = 0.0
-        _cand.setdefault((_u, _pt), []).append((_val, _ge, r.get("csv_path"), str(r.get("dt_str") or "")))
-    _res_map = {}
-    for _k, _lst in _cand.items():
+        try:
+            _tt = float(r.get("dt_ts") or 0.0)
+        except Exception:
+            _tt = 0.0
+        _cand.setdefault((_u, _pt), []).append(
+            (_val, _ge, r.get("csv_path"), str(r.get("dt_str") or ""), _tt))
+    _cache = _scan_cache_load(cache_path) if cache_path else None
+    _n_cached = _n_scanned = 0
+    _total = max(1, len(_cand))
+    _per = {}
+    for _i, (_k, _lst) in enumerate(_cand.items(), 1):
+        # 齿轮判读仍用“幅值最高”的那条（和以前一致，便于和旧报告对照）
         if "发电机" in _k[1]:
-            _lst.sort(key=lambda x: (-x[1], -x[0]))
+            _by_val = sorted(_lst, key=lambda x: (-x[1], -x[0]))
         else:
-            _lst.sort(key=lambda x: -x[0])
-        if _lst[0][0] < 0.15 and "发电机" not in _k[1]:
+            _by_val = sorted(_lst, key=lambda x: -x[0])
+        if _by_val[0][0] < 0.15 and "发电机" not in _k[1]:
             continue
-        _hit = None
         _n_pt += 1
-        if not any(_x[2] for _x in _lst[:2]):
+        # 包络判读看最近的若干条（按采集时间倒序），而不是只挑最大的
+        _recent = sorted([x for x in _lst if x[2]],
+                         key=lambda x: (x[4], x[3]), reverse=True)[:ENV_SCAN_FILES]
+        if not _recent:
             _n_miss += 1
-        for _val, _ge, _p, _ts in _lst[:2]:
-            if not _p:
-                continue
-            _r = report_env_peak(_p, _k[1], project)
-            if _r and (_hit is None or _r["amp"] > _hit["amp"]):
-                _hit = dict(_r)
-                _hit["csv"] = _p
-                _hit["ts"] = _ts
-        if _hit:
-            _res_map[_k] = _hit
+        _files = []
+        for _val, _ge, _p, _ts, _tt in _recent:
+            _env, _g, _was = _scan_file(_p, _k[1], project, _cache, want_gear=False)
+            _n_cached += 1 if _was else 0
+            _n_scanned += 0 if _was else 1
+            _files.append((_p, _ts, _env))
+        _gear = None
+        _gear_p = next((x[2] for x in _by_val if x[2]), None)
+        if _gear_p:
+            _env0, _gear, _was = _scan_file(_gear_p, _k[1], project, _cache, want_gear=True)
+            _n_cached += 1 if _was else 0
+            _n_scanned += 0 if _was else 1
+        _per[_k] = {"files": _files, "gear": _gear, "gear_csv": _gear_p}
+        if progress is not None:
+            try:
+                progress(_i, _total)
+            except Exception:
+                pass
     REPORT_SCAN_STAT.clear()
-    REPORT_SCAN_STAT.update({"points": _n_pt, "missing": _n_miss})
-    _mids = {}
-    for _k, _r in _res_map.items():
-        _mids.setdefault(_k[1], []).append(_r["amp"])
-    for _pt, _lst in _mids.items():
+    REPORT_SCAN_STAT.update({"points": _n_pt, "missing": _n_miss,
+                             "cached": _n_cached, "scanned": _n_scanned})
+    if cache_path:
+        _scan_cache_save(cache_path, _cache)
+
+    # 相对基线：同测点名跨机组的中位数（单机组时样本不足，只用绝对下限）
+    _peers = {}
+    for (_u, _pt), _d in _per.items():
+        _amps = [e["amp"] for (_p, _ts, e) in _d["files"]
+                 if e and e.get("amp") is not None]
+        if _amps:
+            _peers.setdefault(_pt, []).append(float(np.median(_amps)))
+    _peer_n = {_pt: len(_lst) for _pt, _lst in _peers.items()}
+    for _pt, _lst in _peers.items():
         _lst.sort()
-        _mids[_pt] = _lst[len(_lst) // 2]
-    for _k, _r in _res_map.items():
-        _med = _mids.get(_k[1], 0.0)
-        _thr = max(ENV_FAULT_AMP_MIN, ENV_FAULT_REL * _med)
-        fault_info[_k] = {"alarm": _r["amp"] >= _thr, "amp": _r["amp"], "label": _r["label"],
-                          "hz": _r["hz"], "thr": _thr, "bearing": _r["bearing"],
-                          "order": _r.get("order", 0.0), "csv": _r.get("csv"), "ts": _r.get("ts", "")}
+        _peers[_pt] = _lst[len(_lst) // 2]
+
+    for (_u, _pt), _d in _per.items():
+        _files = _d["files"]
+        _n_files = len(_files)
+        _thr = float(ENV_FAULT_AMP_FLOOR)
+        if _peer_n.get(_pt, 0) >= 3:
+            _thr = max(_thr, float(ENV_FAULT_REL) * float(_peers.get(_pt, 0.0)))
+        _item = {"alarm": False, "level": "正常", "amp": None, "label": "", "hz": 0.0,
+                 "thr": _thr, "bearing": "", "order": 0.0, "csv": None, "ts": "",
+                 "family_hits": 0, "dev": 0.0, "ambiguous": False, "runner": "",
+                 "hits_n": 0, "files_n": _n_files}
+        if _d.get("gear"):
+            _item["gear"] = _d["gear"]
+            _item["gear_csv"] = _d.get("gear_csv")
+        _hits = [(p, ts, e) for (p, ts, e) in _files if e and e.get("amp") is not None]
+        if _hits:
+            # 按“哪只轴承哪个阶次”分组，命中次数多、幅值高的那组作为结论
+            _groups = {}
+            for (p, ts, e) in _hits:
+                _groups.setdefault((e.get("bearing", ""), e.get("label", "")), []).append((p, ts, e))
+            _gt = max(_groups, key=lambda g: (len(_groups[g]),
+                                              float(np.median([x[2]["amp"] for x in _groups[g]]))))
+            _grp = _groups[_gt]
+            _amp_med = float(np.median([x[2]["amp"] for x in _grp]))
+            _rep = min(_grp, key=lambda x: abs(x[2]["amp"] - _amp_med))
+            _e = _rep[2]
+            _item.update({
+                "amp": _amp_med,
+                "label": _e.get("label", ""), "hz": _e.get("hz", 0.0),
+                "bearing": _e.get("bearing", ""), "order": _e.get("order", 0.0),
+                "family_hits": _e.get("family_hits", 0), "dev": _e.get("dev", 0.0),
+                "ambiguous": _e.get("ambiguous", False), "runner": _e.get("runner", ""),
+                "weak": bool(_e.get("weak")), "conflict": _e.get("conflict", ""),
+                "fs": _e.get("fs"), "demod": _e.get("demod"),
+                "csv": _rep[0], "ts": _rep[1], "hits_n": len(_grp)})
+            # 证据不足/与正常成分重合/两只轴承分不清 → 一律不升“警告”，最多“关注”
+            _blocked = bool(_item.get("weak") or _item.get("conflict") or _item.get("ambiguous"))
+            if _n_files >= 2:
+                _warn = (_item["hits_n"] >= ENV_MIN_HITS) and (_amp_med >= _thr) and not _blocked
+            else:
+                # 只有 1 条记录时不能靠“复现”确认，要求明显超过阈值才报
+                _warn = (_amp_med >= 1.5 * _thr) and not _blocked
+            if _warn:
+                _item["alarm"] = True
+                _item["level"] = "警告"
+            elif _amp_med >= 0.6 * _thr or _item["hits_n"] >= 2:
+                _item["level"] = "关注"
+        fault_info[(_u, _pt)] = _item
     return fault_info
 
 
@@ -5320,18 +7559,56 @@ def report_point_cn(point):
 
 
 def report_apply_faults(agg, fault_info, scan_faults=True):
-    """把包络判定结果写回 agg：fault / fault_lab / csv / amp / grade。"""
+    """把包络判定 + 齿轮判读结果写回 agg：fault / fault_lab / gear / grade。"""
     for _u, _pts in agg.items():
         for _pt, _d in _pts.items():
             _f = fault_info.get((_u, _pt))
             if _f is not None:
                 _d["fault"] = _f["alarm"]
-                _d["fault_lab"] = "%s %.1fHz 幅值 %.2f" % (_f["label"], _f["hz"], _f["amp"])
-                _d["csv"] = _f.get("csv")
-                _d["amp"] = _f["amp"]
-                _d["ts"] = _f.get("ts", _d.get("ts", ""))
+                if _f.get("label") and _f.get("amp") is not None:
+                    _d["fault_lab"] = "%s %.1fHz 幅值 %.2f" % (_f["label"], _f["hz"], _f["amp"])
+                    if _f.get("bearing"):
+                        _d["fault_lab"] += "（%s" % _f["bearing"]
+                        if _f.get("family_hits"):
+                            _d["fault_lab"] += "，谐波族 %d 阶" % _f["family_hits"]
+                        if _f.get("dev") is not None:
+                            _d["fault_lab"] += "，偏差 %+.1f%%" % (float(_f["dev"]) * 100.0)
+                        _d["fault_lab"] += "）"
+                        if _f.get("ambiguous") and _f.get("runner"):
+                            _d["fault_lab"] += "，与 %s 接近、需结合趋势复核" % _f["runner"]
+                    # 判定依据写进报告：复现次数 + 阈值，方便人工复核
+                    if _f.get("files_n") and _f.get("hits_n"):
+                        _d["fault_lab"] += "，近 %d 次中 %d 次命中" % (_f["files_n"], _f["hits_n"])
+                    if _f.get("thr"):
+                        _d["fault_lab"] += "，阈值 %.2f" % float(_f["thr"])
+                    if _f.get("weak"):
+                        _d["fault_lab"] += "，仅 1× 命中、证据不足"
+                    if _f.get("conflict"):
+                        _d["fault_lab"] += "，临近%s、需排除" % _f["conflict"]
+                if _f.get("csv"):
+                    _d["csv"] = _f["csv"]
+                    _d["amp"] = _f["amp"]
+                if _f.get("ts"):
+                    _d["ts"] = _f["ts"]
+                # 判读依据（采样率/解调带/阈值）挂到 agg，模板与直接生成的报告都要用
+                if _f.get("fs"):
+                    _d["env_fs"] = _f["fs"]
+                if _f.get("demod"):
+                    _d["env_demod"] = _f["demod"]
+                if _f.get("thr"):
+                    _d["env_thr"] = _f["thr"]
+                if _f.get("gear"):
+                    _g = _f["gear"]
+                    _d["gear"] = _g
+                    _d["gear_lab"] = report_gear_label(_g)
+                    if not _f.get("csv") and _f.get("gear_csv"):
+                        _d["csv"] = _f["gear_csv"]
                 if _f["alarm"]:
                     _d["grade"] = "警告"
+                elif _f.get("level") == "关注":
+                    _d["grade"] = "关注"
+                elif (_f.get("gear") or {}).get("level") in ("警告", "关注"):
+                    _d["grade"] = _f["gear"]["level"]
                 else:
                     _d["grade"] = "数据异常" if _d.get("data_bad") else "正常"
             elif scan_faults:
@@ -5407,12 +7684,216 @@ def report_period_key(d0, d1):
     return "%s_%s" % (d0.isoformat() if d0 else "?", d1.isoformat() if d1 else "?")
 
 
-def prev_period(prof, key):
-    keys = [k for k in ((prof or {}).get("periods") or {}) if k != key]
-    if not keys:
-        return None
-    keys.sort()
-    return keys[-1]
+
+REVIEW_COLUMNS = [
+    "机组", "测点", "等级", "轴承", "阶次", "频率(Hz)", "幅值", "阈值",
+    "复现(命中/回看)", "弱证据", "邻近正常成分", "候选(需复核)", "文件时间",
+    "采样率(Hz)", "解调带(Hz)", "齿轮结论", "判读说明",
+]
+
+
+def review_rows_from(agg, fault_info):
+    """把 agg + fault_info 摊平成“判读复核表”的行（现场逐条核对用）。
+
+    只做整理、不改任何判定：一行 = 一个机组的一个测点，
+    带上等级、轴承/阶次、实测幅值与阈值、复现次数、弱证据/冲突标记、文件时间和分析参数。
+    """
+    out = []
+    for u in sorted(agg or {}, key=tree_unit_order):
+        for pt in sorted((agg.get(u) or {})):
+            d = agg[u][pt] or {}
+            f = (fault_info or {}).get((u, pt)) or {}
+            amp = f.get("amp")
+            thr = f.get("thr")
+            dem = f.get("demod")
+            try:
+                dem_txt = ("%.0f–%.0f" % (float(dem[0]), float(dem[1]))) if dem else ""
+            except Exception:
+                dem_txt = ""
+            try:
+                fs_txt = ("%g" % float(f["fs"])) if f.get("fs") else ""
+            except Exception:
+                fs_txt = ""
+            hits_n = int(f.get("hits_n") or 0)
+            files_n = int(f.get("files_n") or 0)
+            out.append({
+                "机组": u,
+                "测点": report_point_cn(pt),
+                "等级": d.get("grade", ""),
+                "轴承": f.get("bearing", ""),
+                "阶次": f.get("label", ""),
+                "频率(Hz)": ("%.1f" % float(f["hz"])) if f.get("hz") else "",
+                "幅值": ("%.3f" % float(amp)) if amp is not None else "",
+                "阈值": ("%.3f" % float(thr)) if thr else "",
+                "复现(命中/回看)": ("%d/%d" % (hits_n, files_n)) if files_n else "",
+                "弱证据": "是" if f.get("weak") else "",
+                "邻近正常成分": f.get("conflict", "") or "",
+                "候选(需复核)": f.get("runner", "") or "",
+                "文件时间": (str(f.get("ts") or ""))[:19].replace("T", " "),
+                "采样率(Hz)": fs_txt,
+                "解调带(Hz)": dem_txt,
+                "齿轮结论": d.get("gear_lab", "") or "",
+                "判读说明": d.get("fault_lab", "") or "",
+            })
+    return out
+
+
+REVIEW_APPENDIX_MIN_DAYS = 90   # 报告时段 ≥3 个月才附复核表
+REVIEW_APPENDIX_MAX_ROWS = 300  # 附录最多列这么多条，超出提示用「导出复核表」
+
+
+def review_appendix_needed(d0, d1):
+    """报告时段够不够长（≥90 天）：够长才把复核表附进 Word。"""
+    try:
+        return bool(d0 and d1 and (d1 - d0).days >= REVIEW_APPENDIX_MIN_DAYS)
+    except Exception:
+        return False
+
+
+def append_review_appendix(docx_path, rows, d0, d1):
+    """把判读复核表作为附录追到报告末尾（横向页、只列需复核的行）。
+
+    返回写入表格的行数。正常测点只给计数，不占篇幅——完整 17 列明细仍用
+    「导出复核表」导出 CSV。
+    """
+    from docx import Document
+    from docx.shared import Pt, Cm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.section import WD_ORIENT, WD_SECTION
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    rows = list(rows or [])
+    bad = [r for r in rows if str(r.get("等级") or "") != "正常"]
+    _order = {"危险": 0, "警告": 1, "关注": 2, "数据异常": 3}
+    bad.sort(key=lambda r: (_order.get(str(r.get("等级")), 9),
+                            str(r.get("机组") or ""), str(r.get("测点") or "")))
+    cnt = {}
+    for r in rows:
+        k = str(r.get("等级") or "")
+        cnt[k] = cnt.get(k, 0) + 1
+
+    doc = Document(docx_path)
+    # 附录单独起一节、横向排版：10 列表格竖排会挤成一团
+    sec = doc.add_section(WD_SECTION.NEW_PAGE)
+    try:
+        sec.orientation = WD_ORIENT.LANDSCAPE
+        _w, _h = sec.page_width, sec.page_height
+        if _w is not None and _h is not None and _w < _h:
+            sec.page_width, sec.page_height = _h, _w
+    except Exception:
+        pass
+
+    h = doc.add_paragraph()
+    r = h.add_run("附录  判读复核表")
+    r.bold = True
+    r.font.size = Pt(14)
+    _docx_cn(r)
+
+    days = (d1 - d0).days + 1 if (d0 and d1) else 0
+    span = "%s 至 %s" % (d0.isoformat() if d0 else "-", d1.isoformat() if d1 else "-")
+    intro = doc.add_paragraph()
+    rt = intro.add_run(
+        "统计时段 %s（共 %d 天）。本期共 %d 个机组-测点：警告 %d、关注 %d、数据异常 %d、正常 %d。"
+        "下表列出需人工复核的 %d 条；正常测点不列出，完整 17 列明细可用「导出复核表」导出。"
+        % (span, days, len(rows), cnt.get("警告", 0), cnt.get("关注", 0),
+           cnt.get("数据异常", 0), cnt.get("正常", 0), len(bad)))
+    rt.font.size = Pt(9)
+    _docx_cn(rt)
+
+    if bad:
+        cols = ["序号", "机组", "测点", "等级", "轴承/阶次", "频率(Hz)", "幅值", "阈值", "复现", "判读说明"]
+        widths = [0.9, 1.4, 4.2, 1.5, 3.4, 1.7, 1.5, 1.5, 1.3, 7.6]
+        show = bad[:REVIEW_APPENDIX_MAX_ROWS]
+        t = doc.add_table(rows=1, cols=len(cols))
+        try:
+            t.style = "Table Grid"
+        except Exception:
+            pass
+        t.alignment = WD_TABLE_ALIGNMENT.CENTER
+        hdr = t.rows[0]
+        for i, c in enumerate(cols):
+            cell = hdr.cells[i]
+            cell.text = ""
+            cell.width = Cm(widths[i])
+            rc = cell.paragraphs[0].add_run(c)
+            rc.bold = True
+            rc.font.size = Pt(8.5)
+            _docx_cn(rc)
+            _docx_shade(cell, "DCE6F1")
+        trPr = hdr._tr.get_or_add_trPr()
+        _th = OxmlElement("w:tblHeader")
+        _th.set(qn("w:val"), "true")
+        trPr.append(_th)
+        for k, rr in enumerate(show, 1):
+            cells = t.add_row().cells
+            vals = [str(k), rr.get("机组", ""), rr.get("测点", ""), rr.get("等级", ""),
+                    ("%s %s" % (rr.get("轴承", ""), rr.get("阶次", ""))).strip(),
+                    rr.get("频率(Hz)", ""), rr.get("幅值", ""), rr.get("阈值", ""),
+                    rr.get("复现(命中/回看)", ""), rr.get("判读说明", "")]
+            for i, v in enumerate(vals):
+                cells[i].text = ""
+                cells[i].width = Cm(widths[i])
+                rv = cells[i].paragraphs[0].add_run(str(v))
+                rv.font.size = Pt(8)
+                _docx_cn(rv)
+        if len(bad) > len(show):
+            tail = doc.add_paragraph()
+            rtail = tail.add_run("（表中仅列前 %d 条，其余 %d 条请用「导出复核表」查看完整 CSV。）"
+                                 % (len(show), len(bad) - len(show)))
+            rtail.font.size = Pt(8)
+            _docx_cn(rtail)
+    else:
+        p2 = doc.add_paragraph()
+        r2 = p2.add_run("本期所有机组-测点判读均为正常，无需逐条复核。")
+        r2.font.size = Pt(9)
+        _docx_cn(r2)
+
+    doc.save(docx_path)
+    return len(bad)
+
+
+def report_review_rows(main_dir, d0, d1, project, cache_path=None, progress=None):
+    """按报告同样的口径（时间段 + 包络/齿轮判读）生成复核表行。"""
+    conn = db_connect(main_dir)
+    try:
+        rows = db_load_all(conn)
+    finally:
+        conn.close()
+    picked = []
+    for r in rows:
+        dt = r.get("dt_date")
+        if isinstance(dt, str):
+            try:
+                dt = date.fromisoformat(dt)
+            except Exception:
+                dt = None
+        if d0 and (dt is None or dt < d0):
+            continue
+        if d1 and (dt is None or dt > d1):
+            continue
+        picked.append(r)
+    if not picked:
+        return []
+    prof = load_profile(main_dir) or {}
+    agg = report_stats(picked, bool(prof.get("vdi_only_normal", True)))
+    if not agg:
+        return []
+    fi = report_scan_faults(agg, picked, project, cache_path=cache_path, progress=progress)
+    report_apply_faults(agg, fi, True)
+    return review_rows_from(agg, fi)
+
+
+def write_review_csv(path, rows, columns=None):
+    """写复核表 CSV（UTF-8 BOM，Excel 双击不乱码）。返回写入行数。"""
+    cols = list(columns or REVIEW_COLUMNS)
+    with io.open(path, "w", encoding="utf-8-sig", newline="") as fp:
+        w = csv.DictWriter(fp, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for r in rows or []:
+            w.writerow({c: r.get(c, "") for c in cols})
+    return len(rows or [])
 
 
 def collect_period(agg, d0, d1, prof):
@@ -5469,13 +7950,43 @@ def merge_period(prof, key, rec):
     return prof
 
 
-def alarm_diff(prev_rec, cur_rec):
-    p = {(a["unit"], a["point"]): a for a in ((prev_rec or {}).get("alarms") or [])}
-    c = {(a["unit"], a["point"]): a for a in ((cur_rec or {}).get("alarms") or [])}
-    new = [c[k] for k in c if k not in p]
-    gone = [p[k] for k in p if k not in c]
-    stay = [(p[k], c[k]) for k in c if k in p]
-    return new, gone, stay
+
+class _ScanProgress:
+    """报告故障扫描的轻量进度窗：一次扫描要读几百个 CSV（几十秒），
+    没有反馈很容易被当成卡死。扫描期间禁止关闭，结束由调用方 close()。"""
+
+    def __init__(self, parent, total=0):
+        self.win = tk.Toplevel(parent)
+        self.win.title("故障特征扫描")
+        self.win.transient(parent)
+        self.win.resizable(False, False)
+        frm = ttk.Frame(self.win, padding=14)
+        frm.pack(fill="both", expand=True)
+        self.lbl = ttk.Label(frm, text="正在扫描轴承/齿轮故障特征… 0/%d" % total)
+        self.lbl.pack(anchor="w")
+        self.bar = ttk.Progressbar(frm, length=340, maximum=max(1, total))
+        self.bar.pack(anchor="w", pady=(8, 0))
+        self.win.protocol("WM_DELETE_WINDOW", lambda: None)   # 扫描中不许关
+        try:
+            center_window(self.win, parent)
+        except Exception:
+            pass
+        self.win.update_idletasks()
+
+    def update(self, done, total):
+        try:
+            self.bar["maximum"] = max(1, int(total))
+            self.bar["value"] = int(done)
+            self.lbl.config(text="正在扫描轴承/齿轮故障特征… %d/%d" % (int(done), int(total)))
+            self.win.update_idletasks()
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
 
 
 class ReportDialog(tk.Toplevel):
@@ -5529,6 +8040,7 @@ class ReportDialog(tk.Toplevel):
         bar = ttk.Frame(frm)
         bar.grid(row=6, column=0, columnspan=2, sticky="e")
         ttk.Button(bar, text="生成报告", command=self._go).pack(side="left", padx=6)
+        ttk.Button(bar, text="导出复核表", command=self._export_review).pack(side="left", padx=6)
         ttk.Button(bar, text="取消", command=self.destroy).pack(side="left")
 
         ttk.Label(frm, text="项目档案：每次生成报告会记录本期机组/测点、无数据测点与报警记录，\n"
@@ -5604,18 +8116,58 @@ class ReportDialog(tk.Toplevel):
             pass
         return date.today(), date.today()
 
-    @staticmethod
-    def _parse_date(txt):
-        txt = str(txt or "").strip()
-        if not txt:
-            return None
-        txt = txt.replace("/", "-").replace(".", "-").replace("年", "-").replace("月", "-").replace("日", "")
-        parts = [p for p in txt.split("-") if p.strip()]
+    def _export_review(self):
+        """导出判读复核表（CSV，Excel 可直接打开）：现场逐条核对用。"""
+        proj = self.var_proj.get()
+        d = self.map.get(proj)
+        if not d:
+            messagebox.showwarning("提示", "请先选择项目目录")
+            return
+        d0 = self.dp0.get_date()
+        d1 = self.dp1.get_date()
+        if d0 and d1 and d0 > d1:
+            d0, d1 = d1, d0
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        rng = "%s_%s" % (d0.isoformat() if d0 else "起",
+                         d1.isoformat() if d1 else "止")
+        path = filedialog.asksaveasfilename(
+            title="导出判读复核表", defaultextension=".csv",
+            initialfile="判读复核表_%s_%s_%s.csv" % (proj, rng, stamp),
+            filetypes=[("CSV 表格", "*.csv")])
+        if not path:
+            return
+        prog = None
         try:
-            y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
-            return date(y, m, d)
+            prog = _ScanProgress(self)
         except Exception:
-            return None
+            prog = None
+        try:
+            rows = report_review_rows(
+                d, d0, d1, proj,
+                cache_path=os.path.join(d, SCAN_CACHE_FILE),
+                progress=(prog.update if prog is not None else None))
+        except Exception as ex:
+            messagebox.showerror("导出失败", "生成复核表失败：%s" % ex)
+            return
+        finally:
+            if prog is not None:
+                try:
+                    prog.close()
+                except Exception:
+                    pass
+        if not rows:
+            messagebox.showwarning("提示", "该时间段内没有可判读的数据。")
+            return
+        try:
+            write_review_csv(path, rows)
+        except Exception as ex:
+            messagebox.showerror("导出失败", "写文件失败：%s" % ex)
+            return
+        n_warn = sum(1 for r in rows if r.get("等级") == "警告")
+        n_watch = sum(1 for r in rows if r.get("等级") == "关注")
+        messagebox.showinfo(
+            "导出完成",
+            "已导出 %d 行（警告 %d、关注 %d）：\n%s" % (len(rows), n_warn, n_watch, path))
 
     def _go(self):
         proj = self.var_proj.get()
@@ -5672,8 +8224,26 @@ class ReportDialog(tk.Toplevel):
                         _lst.append(_pt)
         except Exception:
             pass
+        # 故障扫描（轴承包络 + 齿轮边带）统一在这里做，模板路径与内置版式共用同一份结论；
+        # 结果按「文件 + 测点」缓存到项目目录，第二次生成只补新文件。
+        _fi, _prog = {}, None
+        try:
+            _prog = _ScanProgress(self)
+        except Exception:
+            _prog = None
+        try:
+            _fi = report_scan_faults(
+                agg, picked, proj,
+                cache_path=os.path.join(d, SCAN_CACHE_FILE),
+                progress=(_prog.update if _prog is not None else None))
+        except Exception:
+            _fi = {}
+        finally:
+            if _prog is not None:
+                _prog.close()
+        report_apply_faults(agg, _fi, True)
         pkey, rec = collect_period(agg, d0, d1, prof)
-        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "输出")
+        out_dir = os.path.join(APP_DIR, "输出")
         try:
             os.makedirs(out_dir, exist_ok=True)
         except Exception:
@@ -5687,7 +8257,7 @@ class ReportDialog(tk.Toplevel):
             _tmpl = profile_template(prof) if prof else None
             if not _tmpl or not os.path.exists(_tmpl):
                 # 项目档案没登记/路径失效：自动在程序目录与项目目录里找模板
-                _base = os.path.dirname(os.path.abspath(__file__))
+                _base = APP_DIR
                 _dirs = [os.path.join(_base, "数据", "模板"), os.path.join(_base, "模板"),
                          os.path.join(proj, "模板") if proj else "", _base]
                 _cands = []
@@ -5701,11 +8271,14 @@ class ReportDialog(tk.Toplevel):
                 if _cands:
                     _tmpl = max(_cands, key=os.path.getmtime)
             if _tmpl and os.path.exists(_tmpl):
-                import importlib.util as _ilu
-                _spec = _ilu.spec_from_file_location(
-                    "tpl_fill", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tpl_fill.py"))
-                _tf = _ilu.module_from_spec(_spec)
-                _spec.loader.exec_module(_tf)
+                if getattr(sys, "frozen", False):
+                    import tpl_fill as _tf
+                else:
+                    import importlib.util as _ilu
+                    _spec = _ilu.spec_from_file_location(
+                        "tpl_fill", os.path.join(APP_DIR, "tpl_fill.py"))
+                    _tf = _ilu.module_from_spec(_spec)
+                    _spec.loader.exec_module(_tf)
 
                 def _figc(u, pt, _agg=agg):
                     d = _agg[u][pt]
@@ -5718,25 +8291,62 @@ class ReportDialog(tk.Toplevel):
 
                 def _capc(u, pt, png):
                     d = agg[u][pt]
-                    return "图%s-1 %s测点包络谱图（%s）" % (
+                    return "图%s-1 %s测点振动图谱（%s）" % (
                         u.rstrip("#"), report_point_cn(pt), (d.get("ts") or "")[:16].replace("T", " "))
+
+                def _mode_txt(g):
+                    """把“频谱形态 → 疑似故障类型”的证据接在齿轮结论后面。"""
+                    if not g or not g.get("mode"):
+                        return ""
+                    why = "、".join(g.get("mode_why") or [])
+                    return ("按频谱形态判读，疑似%s（置信度 %.0f%%；依据：%s）。"
+                            % (g["mode"], (g.get("mode_score") or 0.0) * 100.0, why or "-"))
 
                 def _anac(u, pt):
                     d = agg[u][pt]
-                    return ("如图 %s-1 所示，%s测点包络谱图中存在轴承故障阶次（%s），判断该测点存在轴承损伤特征，"
-                            "等级：警告，建议加强跟踪监测。" % (u.rstrip("#"), report_point_cn(pt),
-                                                                d.get("fault_lab", "")))
+                    g = d.get("gear")
+                    if d.get("fault"):
+                        t = ("如图 %s-1 所示，%s测点包络谱图中存在轴承故障阶次（%s），判断该测点存在轴承损伤特征，"
+                             "等级：警告，建议加强跟踪监测。" % (u.rstrip("#"), report_point_cn(pt),
+                                                                 d.get("fault_lab", "")))
+                        if g:
+                            t += ("同时，齿轮啮合频率 %.1fHz 两侧出现间隔 %.2fHz 的边带（≈%s），"
+                                  "边带/主峰幅值比 %.2f，齿轮啮合存在异常特征。"
+                                  % (g["mesh"], g.get("spacing") or 0.0, g.get("match") or "未对上",
+                                     g.get("ratio") or 0.0))
+                        t += _mode_txt(g)
+                        t += report_evidence_text(d.get("env_fs"), d.get("env_demod"),
+                                                  d.get("env_thr"), d.get("ts"))
+                        return t
+                    if g:
+                        return ("如图 %s-1 所示，%s测点幅值谱中齿轮啮合频率 %.1fHz 两侧出现间隔 %.2fHz 的边带（≈%s），"
+                                "边带/主峰幅值比 %.2f，判断该测点存在齿轮啮合异常特征，等级：警告，"
+                                "建议安排齿面检查并缩短跟踪周期。%s" % (
+                                    u.rstrip("#"), report_point_cn(pt), g["mesh"],
+                                    g.get("spacing") or 0.0, g.get("match") or "未对上",
+                                    g.get("ratio") or 0.0, _mode_txt(g)))
+                    return ("如图 %s-1 所示，%s测点振动值偏高但未见明确的轴承/齿轮故障阶次，"
+                            "建议结合现场情况复核。" % (u.rstrip("#"), report_point_cn(pt)))
 
                 _tf.fill(_tmpl, path, proj, d0, d1, agg, list(agg.keys()), report_part_of,
                          {"正常": 0, "数据异常": 1, "关注": 2, "警告": 3, "危险": 4},
                          prof=prof, rows=picked,
                          fig_cb=_figc, caption_cb=_capc, analysis_cb=_anac)
             else:
-                build_template_report(path, proj, d0, d1, agg, picked, prof=prof, cur=rec)
+                # 已经在上面扫过一遍，这里不能再扫（否则同样的 CSV 读两遍、多等一倍时间）
+                build_template_report(path, proj, d0, d1, agg, picked, prof=prof,
+                                      cur=rec, scan_faults=False)
         except Exception as ex:
             import traceback
             messagebox.showerror("生成失败", "%s\n%s" % (ex, traceback.format_exc()[:800]))
             return
+        # 统计时段 ≥3 个月：把判读复核表附在报告末尾（复用同一批 _fi，不重新扫描）
+        _appx_n = 0
+        try:
+            if review_appendix_needed(d0, d1):
+                _appx_n = append_review_appendix(path, review_rows_from(agg, _fi), d0, d1)
+        except Exception as _ex:
+            log_error("report_appendix", _ex)
         try:
             os.startfile(path)
         except Exception:
@@ -5748,7 +8358,8 @@ class ReportDialog(tk.Toplevel):
             _saved = "\n项目档案已更新：%s（期次 %s）" % (profile_path(d), pkey)
         except Exception:
             _saved = ""
-        messagebox.showinfo("完成", "报告已生成：\n%s%s" % (path, _saved))
+        _appx_txt = ("\n已附判读复核表：%d 条" % _appx_n) if _appx_n else ""
+        messagebox.showinfo("完成", "报告已生成：\n%s%s%s" % (path, _saved, _appx_txt))
         self.destroy()
 
 
@@ -5780,8 +8391,7 @@ def report_fault_figure(csv_path, point, project, unit, out_png, mark=None):
     info = parse_filename(os.path.basename(csv_path)) or {}
     fs = info.get("fs") or 20000
     rpm = info.get("speed") or 0
-    df = pd.read_csv(csv_path, header=None)
-    sig = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna().values.astype(float)
+    sig, _ = read_signal_csv(csv_path)
     if sig.size < 4096:
         return None
 
@@ -5802,6 +8412,25 @@ def report_fault_figure(csv_path, point, project, unit, out_png, mark=None):
     ax1.grid(alpha=0.25, lw=0.4)
     ax1.set_title("幅值谱 (0–1000Hz)   rpm=%s" % (int(rpm) if rpm else "-"), fontsize=8.5)
 
+    # 齿轮啮合标线：把各级 GMF 画在幅值谱上（对应《齿轮啮合图谱经验》§2）
+    if rpm:
+        try:
+            _prof = profile_for_project(project)
+            _shg = shaft_freqs(rpm, _prof)
+            _ymax1 = ax1.get_ylim()[1]
+            _shown = 0
+            for _g in (_prof or {}).get("gears") or []:
+                _mesh = float(_g.get("teeth") or 0) * float(_shg.get(_g.get("shaft"), 0.0) or 0.0)
+                if not (2 < _mesh <= 1000) or _shown >= 4:
+                    continue
+                ax1.axvline(_mesh, ls="-", lw=0.9, color=GEAR_COLOR, alpha=0.75)
+                ax1.annotate("GMF %.0f" % _mesh, xy=(_mesh, _ymax1 * 0.93),
+                             fontsize=6.0, color=GEAR_COLOR, rotation=90,
+                             va="top", ha="right")
+                _shown += 1
+        except Exception:
+            pass
+
     fe, ae = report_env_curve(csv_path)
     if fe is None:
         fe, ae = np.zeros(1), np.zeros(1)
@@ -5814,7 +8443,7 @@ def report_fault_figure(csv_path, point, project, unit, out_png, mark=None):
     ax2.set_title("包络谱 (0–400Hz，解调 1000–8000Hz)", fontsize=8.5)
 
     if rpm:
-        _sh = _shaft_freqs(rpm)
+        _sh = shaft_freqs(rpm, profile_for_project(project))
         _marks = []
         for nm in report_bearing_names(project, point):
             brg = BEARING_LIB.get(nm)
@@ -5860,8 +8489,7 @@ def report_fault_figure2(csv_paths, point, project, unit, out_png, mark=None):
     if not rpm:
         return None
     try:
-        raw = pd.read_csv(path0, header=None).iloc[:, 0]
-        sig = pd.to_numeric(raw, errors="coerce").dropna().values.astype(float)
+        sig, _ = read_signal_csv(path0)
         if sig.size < fs * 0.3:
             return None
         lo = 1000.0
@@ -5893,7 +8521,7 @@ def report_fault_figure2(csv_paths, point, project, unit, out_png, mark=None):
         keep = lag <= 35.0
         ax2.plot(lag[keep], ac[keep], lw=0.7, color="#8b4513")
         _ord = mark[2] if mark and len(mark) > 2 else None
-        _fr = _shaft_freqs(rpm)
+        _fr = shaft_freqs(rpm, profile_for_project(project))
         _base = _fr.get("H", 0.0) or (rpm / 60.0)
         if _ord and _base > 0:
             for k in (1, 2, 3):
@@ -6222,6 +8850,13 @@ def build_template_report(path, project, d0, d1, agg, rows, prof=None, cur=None,
         _sent.append("另有 %d 台机组本期无有效数据" % _n_nd)
     if _big:
         _sent.append("%d 个测点振动值偏大（占第一限度 ≥80%%）但未见故障特征，判为正常" % len(_big))
+    _gear_hits = [(u, pt, d) for u in units for pt, d in agg[u].items() if d.get("gear_lab")]
+    if _gear_hits:
+        _sent.append("齿轮啮合边带判读显示 %s，等级：%s"
+                     % ("；".join("%s %s（%s）" % (u, report_point_cn(pt), d["gear_lab"])
+                                 for u, pt, d in _gear_hits[:4]),
+                        "警告" if any((d.get("gear") or {}).get("level") == "警告"
+                                    for _u, _pt, d in _gear_hits) else "关注"))
     if not _alarm and fault_info is not None and REPORT_SCAN_STAT.get("points"):
         _mp = int(REPORT_SCAN_STAT.get("missing") or 0)
         _tp = int(REPORT_SCAN_STAT.get("points") or 0)
@@ -6418,7 +9053,9 @@ def build_template_report(path, project, d0, d1, agg, rows, prof=None, cur=None,
                  "该峰族在本期记录中稳定出现，由谱图特征判断故障处于早中期阶段，建议加强跟踪监测。"
                  % (_num, report_point_cn(_pt), _hz, _amp, _base,
                     _f.get("bearing", "—"), _lab.split("×")[0],
-                    (_f.get("order", 0.0) or 0.0), _hz, report_point_cn(_pt)),
+                    (_f.get("order", 0.0) or 0.0), _hz, report_point_cn(_pt))
+                 + report_evidence_text(_f.get("fs"), _f.get("demod"),
+                                        _f.get("thr"), _d.get("ts")),
                  indent=True, after=8)
             _cands = [r for r in rows if r.get("csv_path") and r.get("point") == _pt
                       and report_unit_label(r.get("unit"), r.get("project") or project) == u]
@@ -6485,292 +9122,40 @@ def build_template_report(path, project, d0, d1, agg, rows, prof=None, cur=None,
     return path
 
 
-def build_report_docx(path, project, d0, d1, agg, rows, prof=None, cur=None, scan_faults=True):
-    """生成 Word 分析报告：概况 + 状态汇总 + 超限测点 + 分机组明细 + 无数据/对比/历史 + 结论。
-    prof/cur 为项目档案与本期记录，用于“与上期对比”“历史报警记录”。"""
-    from docx import Document
-    from docx.shared import Pt, Cm, RGBColor
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.enum.table import WD_TABLE_ALIGNMENT
-    from docx.enum.section import WD_ORIENT
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
 
-    HEAD_FONT = "黑体"
-    BODY_FONT = "宋体"
-    COLOR_HEAD = RGBColor(0x1F, 0x3B, 0x63)
-    STATUS_FILL = {"正常": "C6EFCE", "关注": "FFF2CC", "警告": "FFEB9C", "危险": "FFC7CE", "数据异常": "E7E6E6"}
 
-    doc = None
-    _tmpl = profile_template(prof)
-    if _tmpl:
-        try:
-            doc = Document(_tmpl)          # 沿用项目模板的页面设置与样式
-            _body = doc.element.body
-            for _ch in list(_body):
-                if not _ch.tag.endswith("}sectPr"):
-                    _body.remove(_ch)
-        except Exception:
-            doc = None
-    if doc is None:
-        doc = Document()
-    sec = doc.sections[0]
-    if _tmpl:
-        for _hf in (sec.header, sec.footer):      # 模板的页眉页脚整段清空，避免串项目名/残留横线
-            _el = _hf._element
-            for _ch in list(_el):
-                if _ch.tag.endswith("}p") or _ch.tag.endswith("}tbl"):
-                    _el.remove(_ch)
-            _el.append(OxmlElement("w:p"))
-    sec.page_width, sec.page_height = Cm(21.0), Cm(29.7)
-    sec.left_margin = sec.right_margin = Cm(2.2)
-    sec.top_margin = Cm(2.4)
-    sec.bottom_margin = Cm(2.2)
-    st = doc.styles["Normal"]
-    st.font.name = "Times New Roman"
-    st.font.size = Pt(10.5)
-    st.element.rPr.rFonts.set(qn("w:eastAsia"), BODY_FONT)
+class _DateShim:
+    """无控件的日期对象：替代“只用来 get_date/set_date、不显示”的 DateEntry。
 
-    def para(text, size=10.5, bold=False, cn=BODY_FONT, color=None, align=None,
-             before=0, after=6, line=1.5):
-        p = doc.add_paragraph()
-        r = p.add_run(text)
-        r.bold = bold
-        r.font.size = Pt(size)
-        r.font.color.rgb = color or RGBColor(0, 0, 0)
-        _docx_cn(r, cn)
-        if align is not None:
-            p.alignment = align
-        pf = p.paragraph_format
-        pf.space_before = Pt(before)
-        pf.space_after = Pt(after)
-        pf.line_spacing = line
-        return p
+    tkcalendar 的 DateEntry 即使不 pack（父 Frame 未映射）也会创建一个日历 Toplevel；
+    一旦焦点/事件落到它身上，就会莫名弹出日历窗口（而且显示的是“今天”）。
+    这里只用 datetime 保存日期，接口与 DateEntry 的 get_date/set_date/get 保持一致。
+    """
 
-    def heading(text, size=14):
-        return para(text, size=size, bold=True, cn=HEAD_FONT, color=COLOR_HEAD, before=10, after=6)
+    def __init__(self, d=None):
+        self._date = d if isinstance(d, date) else date.today()
 
-    def table(headers, data, widths=None, head_fill="DCE6F1", status_col=None):
-        t = doc.add_table(rows=1, cols=len(headers))
-        t.style = "Table Grid"
-        t.alignment = WD_TABLE_ALIGNMENT.CENTER
-        hdr = t.rows[0]
-        _trPr = hdr._tr.get_or_add_trPr()
-        _th = OxmlElement("w:tblHeader"); _trPr.append(_th)
-        for i, h in enumerate(headers):
-            c = hdr.cells[i]
-            c.text = ""
-            p = c.paragraphs[0]
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            r = p.add_run(h)
-            r.bold = True
-            r.font.size = Pt(9)
-            _docx_cn(r, HEAD_FONT)
-            _docx_shade(c, head_fill)
-        for row in data:
-            cells = t.add_row().cells
-            for i, v in enumerate(row):
-                cells[i].text = ""
-                p = cells[i].paragraphs[0]
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                r = p.add_run(str(v))
-                r.font.size = Pt(9)
-                _docx_cn(r, BODY_FONT)
-                if status_col is not None and i == status_col:
-                    _docx_shade(cells[i], STATUS_FILL.get(str(v), "FFFFFF"))
-        for row in t.rows:
-            _rp = row._tr.get_or_add_trPr()
-            if _rp.find(qn("w:cantSplit")) is None:
-                _rp.append(OxmlElement("w:cantSplit"))
-        if widths:
-            t.autofit = False
-            _tblPr = t._tbl.tblPr
-            _lay = OxmlElement("w:tblLayout"); _lay.set(qn("w:type"), "fixed"); _tblPr.append(_lay)
-            for i, w in enumerate(widths):
-                t.columns[i].width = Cm(w)
-                for row in t.rows:
-                    row.cells[i].width = Cm(w)
-        return t
+    def get_date(self):
+        return self._date
 
-    # ---------- 标题 ----------
-    para("%s 振动分析报告" % project, size=20, bold=True, cn=HEAD_FONT,
-         color=COLOR_HEAD, align=WD_ALIGN_PARAGRAPH.CENTER, before=30, after=10)
-    para("统计时间段：%s ～ %s" % (d0.isoformat() if d0 else "最早", d1.isoformat() if d1 else "最新"),
-         size=12, align=WD_ALIGN_PARAGRAPH.CENTER, after=4)
-    para("报告生成时间：%s" % datetime.now().strftime("%Y-%m-%d %H:%M"),
-         size=10.5, align=WD_ALIGN_PARAGRAPH.CENTER, after=18)
+    def set_date(self, d):
+        if isinstance(d, datetime):
+            self._date = d.date()
+        elif isinstance(d, date):
+            self._date = d
+        elif isinstance(d, str):
+            txt = d.strip()
+            for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+                try:
+                    self._date = datetime.strptime(txt, fmt).date()
+                    return
+                except ValueError:
+                    continue
+        else:
+            return
 
-    # ---------- 包络谱判定：谱图报警才写报警 ----------
-    fault_info = {}
-    _fi = report_scan_faults(agg, rows, project) if scan_faults else {}
-    report_apply_faults(agg, _fi, scan_faults)
-
-    # ---------- 一、数据概况 ----------
-    units = sorted(agg.keys(), key=tree_unit_order)
-    n_pt = sum(len(v) for v in agg.values())
-    dates = [str(r.get("dt_str") or "") for r in rows if r.get("dt_str")]
-    heading("一、数据概况")
-    para("本报告基于振动在线监测数据自动生成。统计时间段内共 %d 台机组、%d 个测点、%d 条有效记录，"
-         "记录时间从 %s 至 %s。" % (len(units), n_pt, len(rows),
-                                 min(dates) if dates else "-", max(dates) if dates else "-"),
-         after=6)
-    para("计算口径：每个测点按 VDI 3834 频带取带内 RMS（主轴、齿轮箱输入端、齿轮箱一级齿圈取 0.1–10 Hz；"
-         "齿轮箱高速轴取 10–1000 Hz；发电机前后轴承取 10–5000 Hz），取时间段内最大值与平均值；"
-         "占第一限度比例 = 最大带内 RMS ÷ 对应频带第一限度。", after=6)
-    table(["频带", "适用测点", "第一限度 (m/s²)"],
-          [["0.1–10 Hz", "主轴、齿轮箱输入端、齿轮箱一级齿圈", "0.3"],
-           ["10–1000 Hz", "齿轮箱高速轴（含中部/低速轴等）", "7.5"],
-           ["10–5000 Hz", "发电机前后轴承", "10"]],
-          widths=[3.2, 9.0, 4.0])
-    para("等级判定：以包络谱（解调带 1000–8000 Hz）中的轴承故障阶次为准——出现 BPFO/BPFI/BSF 基频峰值、"
-         "幅值 ≥ %.1f 且 ≥ %.0f 倍同型测点中位数时判“警告”，否则判“正常”；VDI 3834 第一限度占比仅作振动量级参考，不单独定级。"
-         % (ENV_FAULT_AMP_MIN, ENV_FAULT_REL), size=9, after=10)
-
-    # ---------- 二、机组状态汇总 ----------
-    heading("二、机组状态汇总")
-    order = {"正常": 0, "数据异常": 1, "关注": 2, "警告": 3, "危险": 4}
-    data = []
-    worst = {}
-    for u in units:
-        row = [u]
-        unit_worst = "正常"
-        for part in REPORT_PART:
-            pts = [d for pt, d in agg[u].items() if report_part_of(pt) == part]
-            if not pts:
-                row.append("—")
-                continue
-            g = max((d["grade"] for d in pts), key=lambda x: order.get(x, 0))
-            row.append(g)
-            if order.get(g, 0) > order.get(unit_worst, 0):
-                unit_worst = g
-        mx = max((d["ratio"] for d in agg[u].values()), default=0.0)
-        row.append("%.0f%%" % (mx * 100))
-        row.append(unit_worst)
-        worst[u] = unit_worst
-        data.append(row)
-    table(["机组", "主轴承", "齿轮箱", "发电机", "最高占限比", "判定等级"], data,
-          widths=[1.9, 3.0, 3.0, 3.0, 3.1, 2.4], status_col=5)
-
-    # ---------- 三、超限测点清单 ----------
-    heading("三、超限测点清单")
-    over = []
-    for u in units:
-        for pt, d in agg[u].items():
-            if d["ratio"] >= 0.8:
-                over.append([u, pt, d["band"], "%.3f" % d["max"], "%.1f" % d["limit"],
-                             "%.0f%%" % (d["ratio"] * 100), d["ts"][:16], d["grade"]])
-    over.sort(key=lambda r: -float(r[5].rstrip("%")))
-    if over:
-        para("时间段内共有 %d 个测点达到或超过第一限度的 80%%，按占比从高到低排列：" % len(over), after=6)
-        table(["机组", "测点", "频带", "最大RMS", "第一限度", "占限比", "最大值时刻", "等级"],
-              over, widths=[1.6, 4.6, 2.6, 2.3, 2.1, 1.8, 3.1, 1.5], status_col=7)
-        _alarms = [(u, pt, d) for u in units for pt, d in agg[u].items() if d.get("fault")]
-        _big = sum(1 for u in units for pt, d in agg[u].items() if d.get("ratio", 0) >= 0.8 and not d.get("fault"))
-        if _big:
-            para("注：另有 %d 个测点振动值偏大（占第一限度 ≥80%%）但包络谱未见轴承故障阶次，判为正常，建议持续跟踪。" % _big,
-                 size=9, after=4)
-        if _alarms:
-            para("包络谱报警测点：" + "；".join("%s %s（%s）" % (u, pt, d.get("fault_lab", "")) for u, pt, d in _alarms),
-                 size=9, after=8)
-    else:
-        para("时间段内所有测点带内 RMS 均低于第一限度的 80%，机组运行状态稳定。", after=6)
-
-    # ---------- 四、分机组明细 ----------
-    heading("四、分机组测点明细")
-    for u in units:
-        pts = sorted(agg[u].keys(), key=tree_point_order)
-        para("%s机组" % u, size=11, bold=True, cn=HEAD_FONT, before=8, after=4)
-        data = []
-        for pt in pts:
-            d = agg[u][pt]
-            data.append([pt, d["band"], "%.3f" % d["mean"], "%.3f" % d["max"],
-                         "%.1f" % d["limit"], "%.0f%%" % (d["ratio"] * 100),
-                         d["ts"][:16], d["grade"]])
-        table(["测点", "频带", "平均RMS", "最大RMS", "第一限度", "占限比", "最大值时刻", "等级"],
-              data, widths=[4.4, 2.6, 2.2, 2.2, 2.0, 1.8, 3.1, 1.5], status_col=7)
-
-    # ---------- 五、无数据机组与测点 ----------
-    heading("五、数据异常与无数据测点")
-    _dbad = [(u, pt, d) for u in units for pt, d in sorted(agg[u].items()) if d.get("data_bad")]
-    if _dbad:
-        para("数值异常测点（远低于同型机组，疑似传感器未可靠安装或采集通道故障，本期不纳入趋势对比）：", after=4)
-        for _u, _pt, _d in _dbad:
-            para("· %s %s：最大值 %.4f m/s²，仅为同型中位（%.4f）的 %.0f%%。"
-                 % (_u, _pt, _d["max"], _d.get("peer_med", 0.0),
-                    (_d["max"] / _d["peer_med"] * 100.0) if _d.get("peer_med") else 0), size=9, after=2)
-    nd_u = (cur or {}).get("no_data_units") or []
-    nd_p = (cur or {}).get("no_data_points") or []
-    if nd_u:
-        para("本期缺数机组（历史有数据、本期无数据）：%s。" % "、".join(nd_u), after=4)
-    if nd_p:
-        para("本期缺数测点：%s。" % "；".join("%s %s" % (x["unit"], "、".join(x["points"]))
-                                          for x in nd_p), after=4)
-    if not nd_u and not nd_p:
-        para("本期全部机组、全部测点均有有效数据。", after=4)
-
-    # ---------- 六、历史报警记录 ----------
-    heading("六、历史报警记录")
-    _hist = []
-    for _k in sorted((prof or {}).get("periods") or {}):
-        if _k == (cur or {}).get("label"):
-            continue
-        for a in (prof["periods"][_k].get("alarms") or []):
-            _hist.append([_k, a["unit"], a["point"], "%.0f%%" % (a["ratio"] * 100),
-                          a["grade"], a.get("time", "")])
-    _hist = _hist[-40:]
-    if _hist:
-        table(["期次", "机组", "测点", "占限比", "等级", "最大值时刻"], _hist,
-              widths=[2.0, 1.8, 5.0, 1.9, 1.8, 3.6], status_col=4)
-    else:
-        para("暂无历史报警记录（生成第二期报告后自动累积）。", after=4)
-
-    # ---------- 七、结论 ----------
-    heading("七、结论")
-    bad = [u for u in units if worst.get(u) in ("警告", "危险")]
-    dgr = [u for u in units if worst.get(u) == "危险"]
-    att = [u for u in units if worst.get(u) == "关注"]
-    _no = 1
-    if dgr:
-        para("（%d）%s 等 %d 台机组有测点达到危险等级（超第一限度 150%%），建议尽快安排停机检查。"
-             % (_no, "、".join(dgr), len(dgr)), after=4)
-        _no += 1
-    bad_w = [u for u in bad if worst.get(u) != "危险"]
-    if bad_w:
-        para("（%d）%s 等 %d 台机组存在振动超限测点（警告等级），建议结合频谱与包络分析确认故障部位，加强跟踪。"
-             % (_no, "、".join(bad_w), len(bad_w)), after=4)
-        _no += 1
-    _badu = []
-    for _u in units:
-        if any(d.get("data_bad") for d in agg[_u].values()) and _u not in _badu:
-            _badu.append(_u)
-    if _badu:
-        para("（%d）%s 等 %d 台机组存在测点数据异常（振动值远低于同型机组），建议核查传感器安装与采集通道。"
-             % (_no, "、".join(_badu), len(_badu)), after=4)
-        _no += 1
-    if att:
-        para("（%d）%s 等 %d 台机组有个别测点接近第一限度，建议加强跟踪监测。"
-             % (_no, "、".join(att), len(att)), after=4)
-    if not bad and not att:
-        para("时间段内各机组各测点振动值均在第一限度以内，机组传动链运行正常。", after=4)
-    para("说明：本报告为按时间段统计的自动生成结果，故障判定需结合包络谱、阶次谱等图谱分析综合判断。",
-         size=9, after=6)
-
-    # ---------- 页脚页码 ----------
-    footer_p = sec.footer.paragraphs[0]
-    footer_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = footer_p.add_run("第 ")
-    r.font.size = Pt(9)
-    _docx_cn(r)
-    fld = OxmlElement("w:fldSimple")
-    fld.set(qn("w:instr"), "PAGE")
-    footer_p._p.append(fld)
-    r2 = footer_p.add_run(" 页")
-    r2.font.size = Pt(9)
-    _docx_cn(r2)
-
-    doc.save(path)
-    return path
-
+    def get(self):
+        return self._date.strftime("%Y-%m-%d")
 
 
 class VibGUI:
@@ -6802,8 +9187,8 @@ class VibGUI:
 
         top = ttk.Frame(root); top.pack(fill="x", padx=5, pady=5)
         ttk.Button(top, text="上传", command=self.select_dir).pack(side="left", padx=3)
-        ttk.Button(top, text="计算数据", command=self.calc_new_files).pack(side="left", padx=3)
-        ttk.Button(top, text="清空缓存", command=self.clear_all_cache).pack(side="left", padx=3)
+        ttk.Button(top, text="补算文件", command=self.calc_new_files).pack(side="left", padx=3)
+        ttk.Button(top, text="清空缓存", command=self._clear_cache_dialog).pack(side="left", padx=3)
         ttk.Button(top, text="图谱分析", command=self.open_spectrum).pack(side="left", padx=3)
         ttk.Button(top, text="分析报告", command=self.open_report).pack(side="left", padx=3)
         self.dir_label = ttk.Label(top, text="未选择项目目录"); self.dir_label.pack(side="left", padx=10)
@@ -6813,17 +9198,17 @@ class VibGUI:
         self._paned = paned
         left = ttk.Frame(paned, width=int(round(244 * ui_k))); paned.add(left, weight=1)
         right = ttk.Frame(paned); paned.add(right, weight=3)
-        _ubar = ttk.Frame(left); _ubar.pack(fill="x", padx=2, pady=(0, 2))
-        ttk.Label(_ubar, text="机组:").pack(side="left")
-        self.unit_sel = tk.StringVar(value="全部机组")
-        self.unit_combo = ttk.Combobox(_ubar, textvariable=self.unit_sel,
-                                       values=["全部机组"], state="readonly", width=12)
-        self.unit_combo.pack(side="left", fill="x", expand=True, padx=(2, 0))
-        self.unit_combo.bind("<<ComboboxSelected>>", self._jump_unit)
-        self.tree = ttk.Treeview(left, columns=("check",), show="tree headings")
+        _tree_wrap = ttk.Frame(left); _tree_wrap.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(_tree_wrap, columns=("check",), show="tree headings")
         self.tree.heading("#0", text="项目/机组/测点"); self.tree.heading("check", text="选择")
         self.tree.column("check", width=int(round(40 * ui_k)), anchor="center")
-        self.tree.pack(fill="both", expand=True)
+        # 右侧竖向滚动条：机组/测点多时不必再靠滚轮硬找
+        _vsb = ttk.Scrollbar(_tree_wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=_vsb.set)
+        _vsb.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+        # 机型里有、但当前还没有数据的测点：灰字占位（不参与勾选）
+        self.tree.tag_configure("nodata", foreground="#9e9e9e")
         self.tree.bind("<Button-1>", self.on_tree_click)
         # 右侧上方数据表格
         table_frame = ttk.Frame(right); table_frame.pack(fill="x", padx=2, pady=2)
@@ -6849,16 +9234,11 @@ class VibGUI:
         self.data_tree.pack(side="left", fill="both", expand=True)
         self.data_tree.bind("<Double-1>", self._on_data_row_double)
         self.data_tree.bind("<Button-3>", self._on_data_tree_menu)   # 右键：批量设置转速
-        # 日期/转速筛选改为趋势图右键弹窗（确认即刷新）；这里仅保留控件宿主、不占布局空间，
-        # 控件不 pack 到可见界面，但 DateEntry 的 get_date/set_date 与变量照常可用，缓存逻辑不变
-        ff = ttk.Frame(right)
-        ttk.Label(ff, text="起始日期:").pack(side="left")
-        self.date_start = DateEntry(ff, date_pattern="yyyy-MM-dd"); self.date_start.pack(side="left", padx=2)
-        ttk.Label(ff, text="结束日期:").pack(side="left", padx=(10, 0))
-        self.date_end = DateEntry(ff, date_pattern="yyyy-MM-dd"); self.date_end.pack(side="left", padx=2)
-        ttk.Label(ff, text="转速>=").pack(side="left", padx=(10, 0))
+        # 日期/转速筛选改为趋势图右键弹窗（确认即刷新）；这里只保留“日期值”，
+        # 不再创建隐藏的 DateEntry（它自带一个日历 Toplevel，会在焦点切换时莫名弹出）。
+        self.date_start = _DateShim()
+        self.date_end = _DateShim()
         self.var_speed_min = tk.StringVar(value="")
-        ttk.Entry(ff, textvariable=self.var_speed_min, width=8).pack(side="left")
         self.fig, self.ax = plt.subplots(figsize=(11, 6), dpi=96)   # 见 SpectrumWindow 里的 dpi 说明
         self.fig.patch.set_facecolor(CHART_BG)
         self.ax.set_facecolor(CHART_BG)
@@ -6871,8 +9251,15 @@ class VibGUI:
         self.trend_title_lbl = ttk.Label(self.trend_info, text="", font=(UI_FONT_FAMILY, 11, "bold"),
                                          anchor="center", style="TrendHeader.TLabel", padding=(8, 5))
         self.trend_title_lbl.grid(row=0, column=0, sticky="ew")
-        self.trend_legend_frame = ttk.Frame(self.trend_info, style="TrendHeader.TFrame")
-        self.trend_legend_frame.grid(row=1, column=0, sticky="w", pady=(2, 5), padx=(8, 0))
+        # 第二行：左边时间范围、右边图例，同一行显示
+        self.trend_meta = ttk.Frame(self.trend_info, style="TrendHeader.TFrame")
+        # sticky="" + 列权重 1 → 整行按内容宽度水平居中
+        self.trend_meta.grid(row=1, column=0, sticky="", pady=(0, 4))
+        self.trend_range_lbl = ttk.Label(self.trend_meta, text="", font=(UI_FONT_FAMILY, 9),
+                                         style="TrendHeader.TLabel")
+        self.trend_range_lbl.pack(side="left")
+        self.trend_legend_frame = ttk.Frame(self.trend_meta, style="TrendHeader.TFrame")
+        self.trend_legend_frame.pack(side="left", padx=(14, 0))
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         self.canvas.get_tk_widget().configure(background=CHART_BG)
@@ -6896,8 +9283,51 @@ class VibGUI:
         # 固定左列宽度（Frame width 会被内部 Treeview 覆盖，用 sashpos 强制）
         root.update_idletasks()
         self._paned.sashpos(0, int(round(244 * ui_k)))
+        # 窗口真正映射后 ttk 可能按“请求宽度”重新分配，把左树压成 0；映射后再设一次，
+        # 并限制拖拽后左列最小宽度，避免把树形图拖没（看起来像“树不见了”）
+        root.after(200, lambda: self._ensure_tree_width())
+        self._paned.bind("<ButtonRelease-1>", self._ensure_tree_width, add="+")
 
-    def open_spectrum(self): SpectrumWindow(self.root, init_dir=self.main_dir)
+    def _ensure_tree_width(self, event=None):
+        """保证左侧树至少 120px：窗口映射/用户拖分隔条后调用。"""
+        try:
+            min_w = 120
+            cur = self._paned.sashpos(0)
+            if cur < min_w:
+                k = max(1.0, ui_dpi(self.root) / 96.0)
+                self._paned.sashpos(0, int(round(244 * k)))
+        except Exception:
+            pass
+
+    def _spectrum_window(self, csv_path=None):
+        """只保留一个「图谱分析」窗口：已打开就前置并载入新文件，不再新开。"""
+        win = getattr(self, "_spec_win", None)
+        try:
+            alive = win is not None and bool(win.winfo_exists())
+        except Exception:
+            alive = False
+        if alive:
+            try:
+                win.deiconify()
+                win.lift()
+                win.focus_force()
+            except Exception:
+                pass
+            if csv_path:
+                try:
+                    win.load_file(csv_path)
+                except Exception as _ex:
+                    log_error("spectrum_reuse", _ex)
+            return win
+        if csv_path:
+            win = SpectrumWindow(self.root, init_dir=self.main_dir, auto_load=csv_path)
+        else:
+            win = SpectrumWindow(self.root, init_dir=self.main_dir)
+        self._spec_win = win
+        return win
+
+    def open_spectrum(self):
+        self._spectrum_window()
 
     def open_report(self):
         """按时间段生成分析报告（Word）。"""
@@ -6915,13 +9345,21 @@ class VibGUI:
         if not d: return
         d = os.path.normpath(d)
         same = [x for x in getattr(self, "project_dirs", []) if os.path.normpath(x) != d]
-        self.project_dirs = [d] + same          # 新上传的排最前，作为当前目录
-        self.main_dir = d
-        self.dir_label.config(text=d)
+        # 新上传的排最前，作为当前目录；父子目录只留父目录（否则同一批 CSV 会被加载两遍）
+        self.project_dirs = dedupe_project_dirs([d] + same)
+        # 选的是已登记父目录下的子目录时，它会被父目录吸收：强制重扫父目录才能发现新文件
+        _key = os.path.normcase(d)
+        _force = next((x for x in self.project_dirs
+                       if os.path.normcase(os.path.normpath(x)) == _key), None)
+        if _force is None:
+            _force = next((x for x in self.project_dirs
+                           if _key.startswith(os.path.normcase(os.path.normpath(x)) + os.sep)), d)
+        self.main_dir = _force
+        self.dir_label.config(text=_force)
         self.save_state()
         self._import_zips_in_dir(d)
         self.load_all_files(on_done=lambda: (self._sync_dates_to_data(), self.build_tree()),
-                            force_dirs=[d])
+                            force_dirs=[_force])
 
     def _dirs_label(self):
         """状态栏文字：单目录显示路径，多目录显示数量 + 当前目录名。"""
@@ -6943,7 +9381,7 @@ class VibGUI:
         self.root.wait_window(dlg)
         if dlg.result is None:
             return
-        self.project_dirs = [d for d in dlg.result if os.path.isdir(d)]
+        self.project_dirs = dedupe_project_dirs([d for d in dlg.result if os.path.isdir(d)])
         self.main_dir = self.project_dirs[0] if self.project_dirs else ""
         self.save_state()
         self.load_all_files(on_done=lambda: (self._sync_dates_to_data(), self.build_tree()))
@@ -6975,38 +9413,42 @@ class VibGUI:
             pass
 
     def _scan_zips(self, zips):
-        """只解析压缩包里的文件名（不解压数据），返回 (待导入条目, 无法识别的名字)。"""
-        entries, problems = [], []
+        """只解析压缩包里的文件名（不解压数据）。
+
+        返回 (待导入条目, 无法识别的名字, 损坏的压缩包)。
+        “损坏”只指连本地文件头都没有的（空文件/根本不是 zip）。现场更常见的是
+        “中央目录丢了、本地头还在”——那种靠 zip_member_names 的兜底照样能列出来。
+        """
+        entries, problems, broken = [], [], []
         point_names = list(rule_dict.keys())
         for zp in zips:
             try:
-                with zipfile.ZipFile(zp) as zf:
-                    for info in zf.infolist():
-                        if info.is_dir():
-                            continue
-                        base = os.path.basename(decode_zip_name(info.filename))
-                        if not base.lower().endswith(".csv"):
-                            continue
-                        parsed = parse_filename(base)
-                        if parsed["point"] and parsed["fs"]:
-                            entries.append({"zp": zp, "member": info.filename, "base": base,
-                                            "project": parsed["project"], "unit": parsed["unit"],
-                                            "point": parsed["point"], "rpm": parsed["speed"] or 0,
-                                            "ts": (parsed["dt"].strftime("%Y%m%d%H%M%S")
-                                                   if parsed["dt"] else ""),
-                                            "fs": parsed["fs"]})
-                            continue
-                        v = parse_vendor_name(base, point_names)
-                        if not v:
-                            problems.append(base)
-                            continue
-                        entries.append({"zp": zp, "member": info.filename, "base": base,
-                                        "project": v["project"], "unit": v["unit"],
-                                        "point": v["point"], "rpm": v["rpm"],
-                                        "ts": v["ts"], "fs": None})
+                for nm in zip_member_names(zp):
+                    base = os.path.basename(decode_zip_name(nm))
+                    if not base.lower().endswith(".csv"):
+                        continue
+                    parsed = parse_filename(base)
+                    if parsed["point"] and parsed["fs"]:
+                        entries.append({"zp": zp, "member": nm, "base": base,
+                                        "project": parsed["project"], "unit": parsed["unit"],
+                                        "point": parsed["point"], "rpm": parsed["speed"] or 0,
+                                        "ts": (parsed["dt"].strftime("%Y%m%d%H%M%S")
+                                               if parsed["dt"] else ""),
+                                        "fs": parsed["fs"]})
+                        continue
+                    v = parse_vendor_name(base, point_names)
+                    if not v:
+                        problems.append(base)
+                        continue
+                    entries.append({"zp": zp, "member": nm, "base": base,
+                                    "project": v["project"], "unit": v["unit"],
+                                    "point": v["point"], "rpm": v["rpm"],
+                                    "ts": v["ts"], "fs": None})
+            except zipfile.BadZipFile:
+                broken.append(os.path.basename(zp))
             except Exception as e:
                 problems.append("%s（%s）" % (os.path.basename(zp), e))
-        return entries, problems
+        return entries, problems, broken
 
     def _existing_import(self, target, e):
         """该压缩包成员是不是已经导入过。
@@ -7032,8 +9474,11 @@ class VibGUI:
         return None
 
     def _import_zips_into(self, zips, target):
-        """解压+改名写入 target。返回 (写入数, 跳过数, 失败列表, 未识别列表, 是否被取消)。"""
-        entries, problems = self._scan_zips(zips)
+        """解压+改名写入 target。
+
+        返回 (写入数, 跳过数, 失败列表, 未识别列表, 损坏列表, 是否被取消)。
+        """
+        entries, problems, broken = self._scan_zips(zips)
         failed = []
         skipped = 0
         todo = []
@@ -7050,7 +9495,7 @@ class VibGUI:
             dlg = ZipImportDialog(self.root, need, info, self._zip_fs_cfg())
             self.root.wait_window(dlg)
             if not dlg.result:
-                return 0, skipped, failed, problems, True
+                return 0, skipped, failed, problems, broken, True
             fs_map = dlg.result
             self._save_zip_fs_cfg(fs_map)
         made = 0
@@ -7060,10 +9505,12 @@ class VibGUI:
                 skipped += 1
                 continue
             try:
-                with zipfile.ZipFile(e["zp"]) as zf:
-                    data = zf.read(e["member"])
+                data = zip_read_member(e["zp"], e["member"])
             except Exception as ex:
                 failed.append("%s：%s" % (e["base"], ex))
+                continue
+            if not data:
+                failed.append("%s：解压中断（压缩包里这条数据不完整）" % e["base"])
                 continue
             n = data.count(b"\n") + (0 if (not data or data.endswith(b"\n")) else 1)
             if n < 100:
@@ -7096,7 +9543,7 @@ class VibGUI:
                 made += 1
             except Exception as ex:
                 failed.append("%s：%s" % (name, ex))
-        return made, skipped, failed, problems, False
+        return made, skipped, failed, problems, broken, False
 
     def _import_zips_in_dir(self, d):
         """上传目录前，先把目录里（含子目录）的压缩包导入。"""
@@ -7107,18 +9554,36 @@ class VibGUI:
                     zips.append(os.path.join(rd, f))
         if not zips:
             return
-        made, skipped, failed, problems, cancelled = self._import_zips_into(sorted(zips), d)
+        n_total, n_bad = zip_health(zips)
+        # 中央目录缺失的比例很高 → 基本可以断定拷贝没完成，先问一句再动手
+        if n_bad and n_bad >= max(3, int(n_total * 0.5)):
+            if not messagebox.askyesno(
+                    "压缩包可能没拷完",
+                    "共 %d 个压缩包，其中 %d 个缺少中央目录（多半是拷贝/下载中断）。\n\n"
+                    "程序会按本地文件头尽量救回完整条目，但截断处的数据补不回来。\n"
+                    "建议先从网关重新完整拷贝，再导入。\n\n仍要导入能救回的部分吗？"
+                    % (n_total, n_bad)):
+                return
+        made, skipped, failed, problems, broken, cancelled = self._import_zips_into(sorted(zips), d)
         if cancelled:
             return
-        if made or failed or problems:
+        if made or failed or problems or broken:
             msg = "压缩包已导入：写入 %d 个文件" % made
             if skipped:
                 msg += "，跳过 %d 个（已导入过）" % skipped
             if failed:
                 msg += "\n失败 %d 个：\n%s" % (len(failed), "\n".join(failed[:5]))
+                n_cut = sum(1 for x in failed if "解压中断" in x)
+                if n_cut:
+                    msg += ("\n（其中 %d 条是压缩包本身不完整：文件在网络传输中被截断，"
+                            "zip 里后面的数据根本没写进来。到源端重新下载这些包再导入，"
+                            "软件这边无法补全。）" % n_cut)
             if problems:
                 msg += "\n未识别 %d 个（文件名里找不到内置测点名）：\n%s" % (
                     len(problems), "\n".join(problems[:5]))
+            if broken:
+                msg += ("\n损坏 %d 个（不是有效 zip：0 字节或压根不是压缩包）：\n%s"
+                        % (len(broken), "\n".join(broken[:5])))
             messagebox.showinfo("导入压缩包", msg)
 
     def load_all_files(self, on_done=None, force_rescan=False, force_dirs=None):
@@ -7127,10 +9592,19 @@ class VibGUI:
         force_dirs：只对这些目录强制重扫（新上传的那个）；其它目录走 SQLite 秒开，
         避免每上传一个项目就把所有项目重新扫一遍。
         """
-        dirs = [d for d in getattr(self, "project_dirs", []) if d and os.path.isdir(d)]
+        dirs = dedupe_project_dirs(
+            [d for d in getattr(self, "project_dirs", []) if d and os.path.isdir(d)])
         if not dirs and self.main_dir and os.path.isdir(self.main_dir):
             dirs = [self.main_dir]
             self.project_dirs = list(dirs)
+        _before = len([d for d in (getattr(self, "project_dirs", None) or []) if d])
+        self.project_dirs = dedupe_project_dirs(self.project_dirs or dirs)
+        if len(self.project_dirs) != _before:
+            # 去重结果写回状态文件，否则每次启动都要再收敛一遍、目录标签也会闪
+            try:
+                self.save_state()
+            except Exception:
+                pass
         self._load_queue = list(dirs)
         self._load_rows = []
         self._load_on_done = on_done
@@ -7149,7 +9623,7 @@ class VibGUI:
     def _load_next_dir(self):
         """加载队列：逐个目录走原有单目录逻辑，结果累加后再统一刷新界面。"""
         if not self._load_queue:
-            self.all_data = list(self._load_rows)
+            self.all_data = dedupe_rows_by_path(self._load_rows)
             self._load_rows = []
             # 注意：项目名归一化必须“按目录”做（各目录内部统一写法），
             # 不能对合并后的总表再做一次，否则不同项目的名字会被强制统一成一个，树里只剩一个项目。
@@ -7164,14 +9638,15 @@ class VibGUI:
         force = self._load_force or (os.path.normpath(d) in self._load_force_dirs)
         try:
             self._load_one_dir(d, force)
-        except Exception:
+        except Exception as e:
+            log_error("load_one_dir:%s" % d, e)
             self._load_next_dir()
 
     def _load_one_dir(self, d, force_rescan):
         def _finish():
             # 当前目录加载完：结果并入累计，继续下一个目录
             self._load_rows.extend(self.all_data)
-            self.all_data = list(self._load_rows)
+            self.all_data = dedupe_rows_by_path(self._load_rows)
             self._load_next_dir()
         self.all_data.clear()
         if not d:
@@ -7222,19 +9697,34 @@ class VibGUI:
                     # 主动上传(force)：迁移入库后继续走路径C，基于库增量扫描并合并新 CSV
             # 路径C 需要扫描：先取库内已有行（键为 csv_path），供增量合并复用
             existing = {r.get("csv_path"): r for r in db_load_all(conn)}
+            rejected = db_load_rejected(conn)
         finally:
             conn.close()
 
+        def _rejected_fresh(csv_full):
+            """上次已判定算不出来，且文件没变（mtime/size 一致）→ 不用重算。"""
+            rj = rejected.get(os.path.normcase(csv_full))
+            if not rj:
+                return False
+            try:
+                st = os.stat(csv_full)
+            except OSError:
+                return False
+            return abs(st.st_mtime - rj[0]) < 1.0 and int(st.st_size) == int(rj[1])
+
         def _stale(csv_full):
             row = existing.get(csv_full)
-            return bool(row is None or row.get("vdi_ver") != VDI_VERSION)
+            if row is not None and row.get("vdi_ver") == VDI_VERSION:
+                return False
+            return not _rejected_fresh(csv_full)
         from concurrent.futures import ThreadPoolExecutor, as_completed
         def _read_one(csv_full):
             # 单个文件出问题绝不能让整个工作线程挂掉（否则进度会永远停在最后一个数字）
             try:
                 # SQLite 行已是唯一缓存：过期文件直接重算，不再读写逐文件 JSON
                 cd, err = process_one_csv(csv_full)
-                if cd is None: return None
+                if cd is None:
+                    return None, (err or "未知原因")
                 cd["csv_path"] = csv_full
                 if not cd.get("project") or not cd.get("unit") or not cd.get("point"):
                     info = parse_filename(os.path.basename(csv_full))
@@ -7245,9 +9735,9 @@ class VibGUI:
                             cd["dt_str"] = info["dt"].strftime("%Y-%m-%d %H:%M:%S")
                             cd["dt_ts"] = info["dt"].timestamp()
                         if info["speed"] is not None: cd["speed"] = info["speed"]
-                return cd
-            except Exception:
-                return None
+                return cd, ""
+            except Exception as e:
+                return None, str(e)
         # 进度弹窗：先 indeterminate 扫描目录，再 determinate 只计算库内缺失/过期的文件
         prog = tk.Toplevel(self.root)
         prog.title("上传数据"); prog.geometry("440x130"); prog.transient(self.root)
@@ -7260,7 +9750,8 @@ class VibGUI:
         prog.protocol("WM_DELETE_WINDOW", lambda: None)  # 计算途中禁止关闭，避免状态半成品
         prog.grab_set()
         state = {"phase": "scan", "done": 0, "todo_total": 0, "rows": [], "finished": False,
-                 "fails": [], "error": None, "t0": time.time()}
+                 "fails": [], "rejects": [], "skipped_rejected": 0,
+                 "error": None, "t0": time.time()}
 
         def worker():
             # 任何异常都必须落到 state["error"] 并置 finished，否则进度窗会永远停在最后一个数字
@@ -7272,7 +9763,15 @@ class VibGUI:
                             csv_list.append(os.path.join(rd, fn))
                 # 复用库内仍存在且版本最新的行；磁盘上已删除的 CSV 不在 csv_list，自然作为孤儿被剔除
                 rows = [existing[p] for p in csv_list if p in existing]
-                todo = [c for c in csv_list if _stale(c)]
+                todo = []
+                for c in csv_list:
+                    row = existing.get(c)
+                    if row is not None and row.get("vdi_ver") == VDI_VERSION:
+                        continue
+                    if _rejected_fresh(c):
+                        state["skipped_rejected"] += 1
+                        continue
+                    todo.append(c)
                 csv_set = set(csv_list)
                 new_rows = []
                 state["todo_total"] = len(todo)
@@ -7283,15 +9782,25 @@ class VibGUI:
                         for fut in as_completed(futs):
                             try:
                                 r = fut.result()
-                            except Exception:
-                                r = None
-                            if r is not None:
-                                rows.append(r)
-                                new_rows.append(r)
+                            except Exception as e:
+                                r = (None, str(e))
+                            cd, err = r if isinstance(r, tuple) else (r, "")
+                            if cd is not None:
+                                rows.append(cd)
+                                new_rows.append(cd)
                             else:
                                 # 计算失败的文件必须显式记录：全量写库后它不会出现，
                                 # 旧实现静默丢弃，用户只看到“记录数变少”却查不到原因。
-                                state["fails"].append(os.path.basename(futs[fut]))
+                                state["fails"].append(
+                                    "%s: %s" % (os.path.basename(futs[fut]), err or "未知原因"))
+                                if reject_cacheable(err):
+                                    try:
+                                        _st = os.stat(futs[fut])
+                                        _mt, _sz = _st.st_mtime, float(_st.st_size)
+                                    except OSError:
+                                        _mt, _sz = 0.0, 0.0
+                                    state["rejects"].append(
+                                        (futs[fut], _mt, _sz, err or "未知原因"))
                             state["done"] += 1
                 state["phase"] = "write"
                 orig_projects = {p: r.get("project") for p, r in existing.items()}
@@ -7305,6 +9814,10 @@ class VibGUI:
                 wconn = db_connect(self.main_dir)
                 try:
                     db_upsert_rows(wconn, upsert)
+                    db_save_rejected(wconn, state.get("rejects") or [])
+                    _ok_paths = [r.get("csv_path") for r in new_rows if r.get("csv_path")]
+                    db_delete_rejected(wconn, [p for p in _ok_paths
+                                               if os.path.normcase(p) in rejected])
                     db_delete_paths(wconn, [p for p in existing if p not in csv_set])
                     db_set_meta(wconn, "vdi_ver", VDI_VERSION)
                     db_set_meta(wconn, "schema_ver", DB_SCHEMA_VERSION)
@@ -7335,14 +9848,19 @@ class VibGUI:
                     finally:
                         rconn.close()
                     normalize_projects(self.all_data)
-                    self.dir_label.config(text=f"{self.main_dir} | 记录数: {len(self.all_data)}")
+                    _skip = int(state.get("skipped_rejected") or 0)
+                    self.dir_label.config(text=f"{self.main_dir} | 记录数: {len(self.all_data)}"
+                                                + (f" | 跳过已判定不可用 {_skip} 个" if _skip else ""))
                     _fails = state.get("fails") or []
                     if _fails:
-                        messagebox.showwarning(
-                            "部分数据未计算",
-                            f"{len(_fails)} 个文件计算失败，已跳过（不会写入趋势库）：\n" +
-                            "\n".join(_fails[:10]) +
-                            (f"\n… 共 {len(_fails)} 个" if len(_fails) > 10 else ""))
+                        _low = [x for x in _fails if "采样点数不足" in x]
+                        _msg = (f"{len(_fails)} 个文件计算失败，已跳过（不会写入趋势库）：\n" +
+                                "\n".join(_fails[:10]) +
+                                (f"\n… 共 {len(_fails)} 个" if len(_fails) > 10 else ""))
+                        if _low:
+                            _msg += ("\n\n其中 %d 个是采样点数不足（< 0.5 s 或读不出来），"
+                                     "建议延长采集时间后重新采集。" % len(_low))
+                        messagebox.showwarning("部分数据未计算", _msg)
                     _finish()
                     return
                 if state["phase"] == "scan":
@@ -7373,80 +9891,6 @@ class VibGUI:
         self.load_all_files(on_done=lambda: (self._sync_dates_to_data(), self.build_tree()),
                             force_rescan=True)
         return
-
-    def _calc_new_files_legacy(self):
-        if not self.main_dir: messagebox.showwarning("提示", "请先选择项目总目录"); return
-        def _needs_recalc(csv_full):
-            cp = get_cache_path(csv_full)
-            if not os.path.exists(cp):
-                return True
-            try:  # 旧版缓存缺 VDI 字段也纳入重算，实现自动补算
-                return json.load(open(cp, encoding="utf-8")).get("vdi_ver") != VDI_VERSION
-            except Exception:
-                return True
-        news = [os.path.join(r, f) for r, _, fs in os.walk(self.main_dir) for f in fs
-                if f.lower().endswith(".csv") and _needs_recalc(os.path.join(r, f))]
-        if not news: messagebox.showinfo("提示", "无新增未计算数据"); return
-        total = len(news)
-        # 进度窗口
-        prog = tk.Toplevel(self.root)
-        prog.title("计算中"); prog.geometry("420x110"); prog.transient(self.root)
-        prog.resizable(False, False)
-        ttk.Label(prog, text=f"共 {total} 个文件待计算...").pack(pady=(12, 4))
-        lbl = ttk.Label(prog, text="准备开始...")
-        lbl.pack()
-        pb = ttk.Progressbar(prog, mode="determinate", maximum=total, length=380)
-        pb.pack(pady=8, padx=20)
-        center_window_later(prog, self.root)
-        prog.grab_set()
-        state = {"done": 0, "ok": 0, "fails": [], "finished": False, "error": None}
-        def worker():
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            try:
-                with ThreadPoolExecutor(max_workers=8) as ex:
-                    futs = {ex.submit(process_one_csv, cp): cp for cp in news}
-                    for fut in as_completed(futs):
-                        try:
-                            out, err = fut.result()
-                        except Exception as e:
-                            out, err = None, str(e)
-                        state["done"] += 1
-                        if out is not None: state["ok"] += 1
-                        else: state["fails"].append(f"{os.path.basename(futs[fut])}: {err}")
-            except Exception:
-                import traceback
-                state["error"] = traceback.format_exc()
-            finally:
-                state["finished"] = True
-        threading.Thread(target=worker, daemon=True).start()
-        def poll():
-            if state["finished"]:
-                prog.destroy()
-                if state.get("error"):
-                    messagebox.showerror("计算失败", state["error"][:1500])
-                    return
-                sp = os.path.join(self.main_dir, SUMMARY_FILE)
-                if os.path.exists(sp): os.remove(sp)
-                def _after_reload():
-                    self._sync_dates_to_data(); self.build_tree()
-                    diag = self._auto_export_diagnostic()
-                    msg = f"新增{total}个,成功{state['ok']}条"
-                    if state["fails"]:
-                        msg += "\n\n失败明细:\n" + "\n".join(state["fails"][:20])
-                        if len(state["fails"]) > 20: msg += f"\n...共{len(state['fails'])}条失败"
-                    if diag:
-                        msg += f"\n\n诊断关注清单: {diag[1]}条\n{diag[0]}"
-                    messagebox.showinfo("完成", msg)
-                self.load_all_files(on_done=_after_reload, force_rescan=True)
-                return
-            try:
-                d = state["done"]
-                pb["value"] = d
-                lbl.config(text=f"已完成 {d}/{total} ({d*100//total}%)")
-            except Exception:
-                pass
-            self.root.after(300, poll)
-        self.root.after(200, poll)
 
     def _auto_export_diagnostic(self):
         """计算/重算后自动生成《诊断关注清单.xlsx》。
@@ -7521,39 +9965,222 @@ class VibGUI:
             messagebox.showwarning("诊断清单", f"生成诊断关注清单失败: {e}")
             return None
 
-    def clear_all_cache(self):
-        dirs = [d for d in getattr(self, "project_dirs", []) if os.path.isdir(d)]
-        if not dirs: return
-        tip = "删除全部缓存?" if len(dirs) == 1 else "删除全部缓存（%d 个项目目录）?" % len(dirs)
-        if not messagebox.askyesno("确认", tip): return
-        n = 0
-        for d in dirs:
-            for r, _, fs in os.walk(d):
-                for f in fs:
-                    if f.endswith(CACHE_SUFFIX):
-                        try:
-                            os.remove(os.path.join(r, f)); n += 1
-                        except Exception: pass
-            sp = os.path.join(d, SUMMARY_FILE)
-            if os.path.exists(sp):
-                try: os.remove(sp)
-                except Exception: pass
-            # 同时删除 SQLite 库及其 WAL/SHM 临时文件，下次上传将全新建库重算
-            for suffix in ("", "-wal", "-shm"):
-                dbp = get_db_path(d) + suffix
+    def _cache_dirs(self):
+        return [d for d in getattr(self, "project_dirs", []) if d and os.path.isdir(d)]
+
+    def _cache_scope(self):
+        """枚举缓存里出现过的项目与年份（用于清空缓存对话框的下拉项）。"""
+        projs, years = set(), set()
+        for d in self._cache_dirs():
+            if not os.path.exists(get_db_path(d)):
+                continue
+            try:
+                conn = db_connect(d)
                 try:
-                    if os.path.exists(dbp): os.remove(dbp)
-                except Exception: pass
-        self.all_data.clear(); self.tree.delete(*self.tree.get_children())
-        # 清空后同步清掉树节点映射/勾选/表格与趋势图，避免界面还停在清空前的旧数据上
+                    for r in conn.execute("SELECT DISTINCT project FROM records"):
+                        if r[0]:
+                            projs.add(str(r[0]))
+                    for r in conn.execute(
+                            "SELECT DISTINCT substr(dt_date,1,4) FROM records "
+                            "WHERE dt_date IS NOT NULL AND dt_date <> ''"):
+                        if r[0]:
+                            years.add(str(r[0]))
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+        return sorted(projs), sorted(years, reverse=True)
+
+    def _clear_cache_dialog(self):
+        """清空缓存：可选项目 + 年/月/日，只删命中的记录（CSV 文件不动）。"""
+        dirs = self._cache_dirs()
+        if not dirs:
+            messagebox.showinfo("提示", "还没有缓存数据。")
+            return
+        projs, years = self._cache_scope()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("清空缓存")
+        dlg.transient(self.root); dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=14); frm.pack(fill="both", expand=True)
+        ALL = "全部"
+
+        v_proj = tk.StringVar(value=ALL)
+        ttk.Label(frm, text="项目：").grid(row=0, column=0, sticky="e", pady=3)
+        cb_proj = ttk.Combobox(frm, textvariable=v_proj, state="readonly", width=32,
+                               values=[ALL] + projs)
+        cb_proj.grid(row=0, column=1, sticky="w", pady=3)
+
+        v_y = tk.StringVar(value=ALL)
+        ttk.Label(frm, text="年：").grid(row=1, column=0, sticky="e", pady=3)
+        cb_y = ttk.Combobox(frm, textvariable=v_y, state="readonly", width=10,
+                            values=[ALL] + years)
+        cb_y.grid(row=1, column=1, sticky="w", pady=3)
+
+        v_m = tk.StringVar(value=ALL)
+        ttk.Label(frm, text="月：").grid(row=2, column=0, sticky="e", pady=3)
+        cb_m = ttk.Combobox(frm, textvariable=v_m, state="readonly", width=10,
+                            values=[ALL] + ["%02d" % i for i in range(1, 13)])
+        cb_m.grid(row=2, column=1, sticky="w", pady=3)
+
+        v_d = tk.StringVar(value=ALL)
+        ttk.Label(frm, text="日：").grid(row=3, column=0, sticky="e", pady=3)
+        cb_d = ttk.Combobox(frm, textvariable=v_d, state="readonly", width=10,
+                            values=[ALL] + ["%02d" % i for i in range(1, 32)])
+        cb_d.grid(row=3, column=1, sticky="w", pady=3)
+
+        tip = ttk.Label(frm, text="选「%s」表示不限；年为「%s」时月/日不生效。\n"
+                                  "只删缓存记录，CSV 原文件不动，之后点「计算数据」会重算。"
+                                  % (ALL, ALL), foreground="#666666")
+        tip.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 6))
+
+        v_bad = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frm, variable=v_bad,
+            text="只清理量级异常数据（峰值 ≥ %g 或 带内RMS ≥ %g m/s²，"
+                 "疑似传感器饱和/单位不对）" % (ABNORMAL_PEAK, ABNORMAL_RMS)
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        def _sync_month():
+            on = v_y.get() != ALL
+            cb_m.configure(state="readonly" if on else "disabled")
+            if not on:
+                v_m.set(ALL); v_d.set(ALL)
+            cb_d.configure(state="readonly" if (on and v_m.get() != ALL) else "disabled")
+            if not (on and v_m.get() != ALL):
+                v_d.set(ALL)
+        cb_y.bind("<<ComboboxSelected>>", lambda e: _sync_month())
+        cb_m.bind("<<ComboboxSelected>>", lambda e: _sync_month())
+        _sync_month()
+
+        def ok():
+            proj = "" if v_proj.get() == ALL else v_proj.get()
+            y = "" if v_y.get() == ALL else v_y.get()
+            m = "" if (not y or v_m.get() == ALL) else v_m.get()
+            dd = "" if (not m or v_d.get() == ALL) else v_d.get()
+            dlg.destroy()
+            self._clear_cache_apply(proj, y, m, dd, only_bad=bool(v_bad.get()))
+
+        bf = ttk.Frame(frm); bf.grid(row=6, column=0, columnspan=2, sticky="e")
+        ttk.Button(bf, text="确定", command=ok).pack(side="left", padx=4)
+        ttk.Button(bf, text="取消", command=dlg.destroy).pack(side="left", padx=4)
+        dlg.bind("<Return>", lambda e: ok())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        center_window(dlg, self.root)
+
+    @staticmethod
+    def _cache_where(proj="", year="", month="", day="", only_bad=False):
+        """把（项目, 年, 月, 日, 是否只看异常）翻成 SQL WHERE；空值表示不限。
+
+        年为「全部」时月/日自然不生效（调用方已置空），这里只做兜底。
+        only_bad 只命中量级异常记录，判据与 process_one_csv 拒收同源。
+        """
+        where, args = [], []
+        if only_bad:
+            where.append("(peak >= ? OR rms >= ?)")
+            args.extend([ABNORMAL_PEAK, ABNORMAL_RMS])
+        if proj:
+            where.append("project = ?"); args.append(proj)
+        if year:
+            where.append("substr(dt_date,1,4) = ?"); args.append(str(year))
+            if month:
+                where.append("substr(dt_date,6,2) = ?"); args.append(str(month))
+                if day:
+                    where.append("substr(dt_date,9,2) = ?"); args.append(str(day))
+        return ((" WHERE " + " AND ".join(where)) if where else ""), args
+
+    def _clear_cache_apply(self, proj="", year="", month="", day="", only_bad=False):
+        sql_where, args = self._cache_where(proj, year, month, day, only_bad)
+        dirs = self._cache_dirs()
+        # 先统计命中条数，0 条就别删了
+        n_hit = 0
+        for d in dirs:
+            if not os.path.exists(get_db_path(d)):
+                continue
+            try:
+                conn = db_connect(d)
+                try:
+                    n_hit += int(conn.execute("SELECT COUNT(*) FROM records" + sql_where,
+                                              args).fetchone()[0])
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+        if n_hit <= 0:
+            messagebox.showinfo("清空缓存", "没有匹配的缓存记录。")
+            return
+        scope = []
+        if proj:
+            scope.append("项目 %s" % proj)
+        if year:
+            scope.append(year + ("-%s" % month if month else "") + ("-%s" % day if day else ""))
+        tip = ("将删除 %d 条缓存记录" % n_hit) + ("（%s）" % "、".join(scope) if scope else "（全部）") + \
+              "。\n\nCSV 原文件不动，之后点「计算数据」会重算。继续？"
+        if not messagebox.askyesno("确认清空缓存", tip):
+            return
+        deleted = 0
+        for d in dirs:
+            if not os.path.exists(get_db_path(d)):
+                continue
+            try:
+                conn = db_connect(d)
+                try:
+                    # 先记下命中的路径，把它们的“已拒收”记录一并删掉，
+                    # 否则清掉缓存后这些文件仍被跳过、用户以为没生效
+                    _paths = [r[0] for r in conn.execute(
+                        "SELECT csv_path FROM records" + sql_where, args)]
+                    db_delete_rejected(conn, _paths)
+                    cur = conn.execute("DELETE FROM records" + sql_where, args)
+                    conn.commit()
+                    deleted += int(cur.rowcount or 0)
+                finally:
+                    conn.close()
+            except Exception as e:
+                log_error("clear_cache:%s" % d, e)
+        # 全量清空时顺手删掉历史遗留的逐文件 .vibcache.json（现在已不用，删掉免得占地方）
+        if not sql_where:
+            for d in dirs:
+                for r, _, fs in os.walk(d):
+                    for f in fs:
+                        if f.endswith(CACHE_SUFFIX):
+                            try:
+                                os.remove(os.path.join(r, f))
+                            except Exception:
+                                pass
+        self._reload_after_cache_clear()
+        messagebox.showinfo("完成", "已删除 %d 条缓存记录。" % deleted)
+
+    def _reload_after_cache_clear(self):
+        """按库里的现存记录重建界面（不重新计算任何文件）。"""
+        rows = []
+        for d in self._cache_dirs():
+            if not os.path.exists(get_db_path(d)):
+                continue
+            try:
+                conn = db_connect(d)
+                try:
+                    rows.extend(db_load_all(conn))
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+        normalize_projects(rows)
+        self.all_data = rows
         self.tree_node_map.clear(); self.checked_points.clear()
+        self.tree.delete(*self.tree.get_children())
         for item in self.data_tree.get_children():
             self.data_tree.delete(item)
         self._table_rows = []; self._table_csvs = []; self._table_iid_csv = {}
         self._table_tags = []
+        try:
+            self._sync_dates_to_data()
+            self.build_tree()
+        except Exception as e:
+            log_error("reload_tree", e)
         self.dir_label.config(text=self._dirs_label())
-        self.plot_trend()
-        messagebox.showinfo("完成", f"删除{n}个缓存")
+        try:
+            self.plot_trend()
+        except Exception as e:
+            log_error("reload_trend", e)
 
     def _sync_dates_to_data(self):
         # 把起止日期自动设为当前缓存数据的最小~最大日期，使打开/切换目录后默认显示全部数据。
@@ -7574,6 +10201,26 @@ class VibGUI:
             self.date_start.set_date(min(ds))
             self.date_end.set_date(max(ds))
 
+    def _expected_points(self, proj):
+        """该项目的机型规定了哪些测点（含没有数据的）。
+
+        机型库 points 是 [[测点名, [轴承...]], ...]，这里只取名字；
+        项目没匹配到机型时返回空表，树里就只显示有数据的测点。
+        """
+        try:
+            prof = profile_for_project(proj)
+        except Exception:
+            prof = None
+        out = []
+        for item in ((prof or {}).get("points") or []):
+            try:
+                nm = str(item[0]).strip()
+            except Exception:
+                nm = str(item).strip()
+            if nm and nm not in out:
+                out.append(nm)
+        return out
+
     def build_tree(self):
         self.tree.delete(*self.tree.get_children()); self.tree_node_map.clear()
         pm = {}
@@ -7581,46 +10228,27 @@ class VibGUI:
             pm.setdefault(row["project"], {}).setdefault(row["unit"], set()).add(row["point"])
         for proj in sorted(pm):
             units = pm[proj]
+            # 占位只针对“本项目里别的机组确实有”的测点：机型库的测点名是给“找轴承”用的，
+            # 跟现场文件里的测点名不一定同名（府谷机型写“主轴承/行星轮”，实际是
+            # “主轴承_前轴径向”），直接拿机型表占位会冒出一堆不存在的测点。
+            observed = set()
+            for _pts in units.values():
+                observed |= _pts
+            expect = [p for p in self._expected_points(proj) if p in observed]
+            order = expect + sorted(observed - set(expect),
+                                    key=lambda x: (tree_point_order(x), x))
             pi = self.tree.insert("", "end", text=proj, values=[""], open=True)
             for unit in sorted(units, key=tree_unit_order):
                 pts = units[unit]
                 ui = self.tree.insert(pi, "end", text=unit, values=[""], open=True)
-                for pt in sorted(pts, key=lambda x: (tree_point_order(x), x)):
-                    ni = self.tree.insert(ui, "end", text=pt, values=["☐"])
-                    self.tree_node_map[f"{proj}|{unit}|{pt}"] = ni
+                for pt in order:
+                    if pt in pts:
+                        ni = self.tree.insert(ui, "end", text=pt, values=["☐"])
+                        self.tree_node_map[f"{proj}|{unit}|{pt}"] = ni
+                    else:
+                        self.tree.insert(ui, "end", text="%s（无数据）" % pt,
+                                         values=[""], tags=("nodata",))
         self._refresh_check_marks()
-        self._refresh_unit_combo()
-
-    def _refresh_unit_combo(self):
-        """机组下拉框：全部机组 + 按 1#..25# 排列。"""
-        try:
-            units = sorted({r["unit"] for r in self.all_data}, key=tree_unit_order)
-            vals = ["全部机组"] + units
-            self.unit_combo.configure(values=vals)
-            if self.unit_sel.get() not in vals:
-                self.unit_sel.set("全部机组")
-        except Exception:
-            pass
-
-    def _jump_unit(self, _evt=None):
-        """下拉选机组后，展开并定位到该机组。"""
-        u = self.unit_sel.get()
-        try:
-            if not u or u == "全部机组":
-                for it in self.tree.get_children():
-                    self.tree.item(it, open=True)
-                    for ch in self.tree.get_children(it):
-                        self.tree.item(ch, open=True)
-                return
-            for proj_iid in self.tree.get_children():
-                for unit_iid in self.tree.get_children(proj_iid):
-                    if self.tree.item(unit_iid, "text") == u:
-                        self.tree.item(proj_iid, open=True)
-                        self.tree.see(unit_iid)
-                        self.tree.selection_set(unit_iid)
-                        return
-        except Exception:
-            pass
 
     def _refresh_check_marks(self):
         for iid in self.tree_node_map.values(): self.tree.item(iid, values=["☐"])
@@ -7644,13 +10272,13 @@ class VibGUI:
         s = self.date_start.get_date(); e = self.date_end.get_date()
         try:
             txt = self.var_speed_min.get().strip(); sm = float(txt) if txt else None
-        except: sm = None
+        except Exception: sm = None
         picked = []
         for r in self.all_data:
             if r.get("dt_date") is None: continue
             try:
                 dd = date.fromisoformat(r["dt_date"]) if isinstance(r["dt_date"], str) else r["dt_date"]
-            except: continue
+            except Exception: continue
             if not (s <= dd <= e): continue
             if sm is not None and (r.get("speed") is None or r["speed"] < sm): continue
             if uf is not None and r["unit"] != uf: continue
@@ -7659,16 +10287,6 @@ class VibGUI:
         # 每次采集都显示，按测点与采集时间排序
         return sorted(picked, key=lambda x: (x["project"], x["unit"], x["point"],
                                              x.get("dt_ts") or 0))
-
-    def _available_bands(self):
-        # 当前勾选测点“联合”支持的 VDI 频带键，按低/中/高顺序返回（任一测点支持即可选）
-        _avail = set()
-        for _k in self.checked_points:
-            _c = vdi_category(_k.split("|")[2])
-            if _c:
-                for _spec in VDI_SPEC[_c]:
-                    _avail.add(_spec[0])
-        return [b for b in _VDI_BAND_ORDER if b in _avail]
 
     def plot_trend(self):
         self.ax.clear(); self.ax2.clear(); titles = []; self._line_rows = {}
@@ -7755,7 +10373,33 @@ class VibGUI:
             self._table_iid_csv[iid] = r.get("csv_path")
             self.data_tree.insert("", "end", iid=iid, values=row, tags=_tag)
         # 标题与图例移到画布外 tk 信息带，绘图区内不再绘制
-        self.trend_title_lbl.config(text=" | ".join(titles) if titles else "未勾选测点")
+        # 第一行：机组 测点趋势图；第二行：时间范围 + 记录条数
+        try:
+            _one = len(self.checked_points) == 1
+            _items = []
+            for key in self.checked_points:
+                _p, _u, _pt = key.split("|")
+                _un = (_u + "#") if str(_u).isdigit() else str(_u)
+                _items.append(f"{_un} {_pt}")
+            if _one and _items:
+                _t1 = f"{_items[0]}测点趋势图"
+            elif _items:
+                _t1 = "、".join(_items) + " 测点趋势图"
+            else:
+                _t1 = "未勾选测点"
+            if all_ts:
+                _lo, _hi = min(all_ts), max(all_ts)
+                _t2 = "时间范围：%s – %s" % (_lo.strftime("%Y/%m/%d"), _hi.strftime("%Y/%m/%d"))
+            else:
+                _t2 = "时间范围：-"
+        except Exception:
+            _t1 = " | ".join(titles) if titles else "未勾选测点"
+            _t2 = ""
+        self.trend_title_lbl.config(text=_t1)
+        try:
+            self.trend_range_lbl.config(text=_t2)
+        except Exception:
+            pass
         _pts = [k.split("|")[2] for k in self.checked_points]
         self._refresh_trend_legend(_pts[0] if len(set(_pts)) == 1 else None)
         self.ax.set_ylabel(r"加速度有效值 m/s$^2$", labelpad=12)
@@ -7890,7 +10534,7 @@ class VibGUI:
         # 仅勾选一个测点时文字带点名，多个测点时只显示参数名
         for w in self.trend_legend_frame.winfo_children():
             w.destroy()
-        _rms_name = "RMS（分频带）"
+        _rms_name = "RMS"
         items = [
             (self.var_show_rms, "\u25cf", "TrendMark0.TLabel", _rms_name),
             (self.var_show_ge, "\u25a0", "TrendMark1.TLabel", "gE"),
@@ -7920,7 +10564,7 @@ class VibGUI:
             def keyf(x):
                 v = x[0][idx]
                 try: return float(v)
-                except: return v
+                except Exception: return v
             rows.sort(key=keyf, reverse=(state == 1))
         self._table_rows = [r for r, _, _ in rows]
         self._table_csvs = [c for _, c, _ in rows]
@@ -8032,7 +10676,7 @@ class VibGUI:
         csv_path = self._table_iid_csv.get(iid)
         if not csv_path or not os.path.exists(csv_path):
             messagebox.showwarning("提示", f"找不到文件:\n{csv_path}"); return
-        SpectrumWindow(self.root, auto_load=csv_path)
+        self._spectrum_window(csv_path)
 
     def _on_trend_right_click(self, event):
         if event.button != 3 or event.inaxes not in (self.ax, self.ax2): return
@@ -8047,6 +10691,8 @@ class VibGUI:
         menu.add_command(label="筛选：日期 / 转速...", command=self._open_filter_dialog)
         menu.add_command(label="复制图片", command=self._copy_trend_figure)
         menu.add_command(label="报警阈值设置...", command=self._open_alarm_dialog)
+        menu.add_separator()
+        menu.add_command(label="查看转速堆叠谱…", command=self._open_speed_stack)
         menu.add_command(label="重置视图", command=self._reset_trend_view)
         menu.add_command(label="操作：左键拖拽框选时段 / 滚轮缩放时间轴", state="disabled")
         try:
@@ -8123,6 +10769,60 @@ class VibGUI:
         top.deiconify()  # 位置确定后再显示，保证窗口管理器按目标坐标摆放
         top.update_idletasks()
         top.grab_set(); top.focus_set()
+
+    def _open_speed_stack(self):
+        """趋势图右键：把当前测点/日期/最低转速带到「转速堆叠谱」独立小工具。"""
+        keys = list(getattr(self, "checked_points", []) or [])
+        if not keys:
+            messagebox.showinfo("提示", "请先在左侧勾选一个测点")
+            return
+        try:
+            _proj, unit, pt = keys[0].split("|")
+        except ValueError:
+            return
+        rows = self._filtered_rows(unit, pt)
+        paths = [r.get("csv_path") for r in rows if r.get("csv_path")]
+        if not paths:
+            messagebox.showinfo("提示", "当前筛选下没有记录")
+            return
+        try:
+            base = os.path.commonpath(paths[:30])
+        except ValueError:
+            base = os.path.dirname(paths[0])
+        try:
+            d0 = self.date_start.get_date().strftime("%Y-%m-%d")
+            d1 = self.date_end.get_date().strftime("%Y-%m-%d")
+        except Exception:
+            d0 = d1 = ""
+        vmin = (self.var_speed_min.get() or "").strip()
+        app_dir = APP_DIR
+        if getattr(sys, "frozen", False):
+            tool_exe = os.path.join(app_dir, "转速堆叠谱", "转速堆叠谱.exe")
+            cmd = [tool_exe, "--gui", "--dir", base, "--point", pt,
+                   "--date-from", d0, "--date-to", d1, "--axis", "order",
+                   "--parent-pid", str(os.getpid())]
+        else:
+            tool = os.path.join(app_dir, "tools", "转速堆叠谱.py")
+            py = sys.executable
+            pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
+            if os.path.exists(pyw):
+                py = pyw
+            cmd = [py, tool, "--gui", "--dir", base, "--point", pt,
+                   "--date-from", d0, "--date-to", d1, "--axis", "order",
+                   "--parent-pid", str(os.getpid())]
+        if vmin:
+            cmd += ["--min-speed", vmin]
+        try:
+            import subprocess
+            if not hasattr(self, "_child_procs"):
+                self._child_procs = []
+            # 清掉已退出的旧句柄
+            self._child_procs = [c for c in self._child_procs if c.poll() is None]
+            self._child_procs.append(
+                subprocess.Popen(cmd, cwd=app_dir,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))
+        except Exception as e:
+            messagebox.showerror("打开失败", str(e))
 
     def _copy_trend_figure(self):
         try:
@@ -8227,24 +10927,7 @@ class VibGUI:
         if not csv_path or not os.path.exists(csv_path):
             messagebox.showwarning("提示", f"找不到文件:\n{csv_path}")
             return
-        SpectrumWindow(self.root, init_dir=self.main_dir, auto_load=csv_path)
-
-    def export_excel(self):
-        if not self.all_data: messagebox.showinfo("提示", "暂无数据"); return
-        units = sorted({r["unit"] for r in self.all_data if r["unit"]})
-        points = sorted({r["point"] for r in self.all_data if r["point"]})
-        dlg = ExportDialog(self.root, units, points); self.root.wait_window(dlg)
-        if not dlg.result: return
-        scope, uf, pf = dlg.result
-        rows = self._filtered_rows(uf, pf) if scope == "one" else self._filtered_rows()
-        if not rows: messagebox.showinfo("提示", "无数据"); return
-        out = [{"项目": r["project"], "机组": r["unit"], "测点": r["point"], "日期": r["dt_date"],
-                "当日最大有效值": round(r["rms"], 4), "报警阈值": r["threshold"],
-                "带通下限Hz": r["f_low"], "带通上限Hz": r["f_high"], "转速": r.get("speed")} for r in rows]
-        sp = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
-        if not sp: return
-        pd.DataFrame(out).to_excel(sp, index=False)
-        messagebox.showinfo("成功", f"导出{len(out)}条\n{sp}")
+        self._spectrum_window(csv_path)
 
     def save_state(self):
         # 先读回现有状态再更新，保留窗口几何等由别处写入的键，避免整体覆写丢失
@@ -8261,12 +10944,15 @@ class VibGUI:
         try:
             with open(STATE_FILE, "w", encoding="utf-8") as fp:
                 json.dump(st, fp, ensure_ascii=False)
-        except: pass
+        except Exception as e:
+            log_error("save_state", e)
 
     def load_state(self):
         if not os.path.exists(STATE_FILE): return
         try: st = json.load(open(STATE_FILE, encoding="utf-8"))
-        except: return
+        except Exception as e:
+            log_error("load_state", e)
+            return
         self.main_dir = st.get("main_dir", "")
         self.project_dirs = [d for d in (st.get("project_dirs") or [])
                              if isinstance(d, str) and d and os.path.isdir(d)]
@@ -8274,7 +10960,7 @@ class VibGUI:
             self.project_dirs.insert(0, self.main_dir)
         self.checked_points = set(st.get("checked", []))
         try: self.date_start.set_date(st.get("start")); self.date_end.set_date(st.get("end"))
-        except: pass
+        except Exception: pass
         self.var_speed_min.set(st.get("speed", ""))
         self.var_show_bc.set(bool(st.get("show_bc", True)))
         self.var_show_cd.set(bool(st.get("show_cd", True)))
@@ -8296,6 +10982,14 @@ class VibGUI:
 
     def on_close(self):
         self.save_state()
+        # 先关掉由主程序打开的“转速堆叠谱”等子窗口，避免主程序退出后它还留着
+        for _c in list(getattr(self, "_child_procs", []) or []):
+            try:
+                if _c.poll() is None:
+                    _c.terminate()
+            except Exception:
+                pass
+        self._child_procs = []
         try:
             if getattr(self, "_trend_resize_job", None):
                 self.root.after_cancel(self._trend_resize_job)
@@ -8306,10 +11000,75 @@ class VibGUI:
             plt.close(self.fig)   # 释放全局 Figure 注册表，避免进程退出前内存不回收
         except Exception:
             pass
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        finally:
+            # 批量计算用的 ThreadPoolExecutor 工作线程是非 daemon 的：关窗时如果还有任务在跑，
+            # 解释器会一直等它们，表现就是“窗口没了、任务栏也没了，进程却还在”，
+            # 下次启动还会被单实例互斥量挡住。这里直接结束进程（状态已保存）。
+            os._exit(0)
+
+
+def _wait_for_window(title="VibSpec", tries=6, delay=0.2):
+    """等已有主窗口出现并激活；第二个进程可能比第一个先到，稍等再试几次。"""
+    tries = max(1, int(tries))
+    for i in range(tries):
+        if _activate_existing_window(title):
+            return True
+        if i + 1 < tries:
+            time.sleep(float(delay))
+    return False
+
+
+def _single_instance_guard():
+    """Windows 命名互斥量：VibSpec 主程序只允许跑一个进程。
+
+    重复启动时把已有主窗口提到前台并退出，不再开第二个。
+    返回 (互斥量句柄, 是否已有实例)；非 Windows 或调用失败时返回 (None, False)。
+    """
+    if os.name != "nt":
+        return None, False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = wintypes.HANDLE
+        k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        h = k32.CreateMutexW(None, False, r"Local\VibSpec_SingleInstance")
+        if not h:
+            return None, False
+        return h, ctypes.get_last_error() == 183   # ERROR_ALREADY_EXISTS
+    except Exception:
+        return None, False
+
+
+def _activate_existing_window(title="VibSpec"):
+    """把已在运行的主窗口提到前台（找不到就算了，至少不让用户开第二个）。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        u32.FindWindowW.restype = wintypes.HWND
+        u32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        hwnd = u32.FindWindowW(None, title)
+        if not hwnd:
+            return False
+        u32.ShowWindow(hwnd, 9)          # SW_RESTORE
+        u32.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
 
 
 if __name__ == "__main__":
+    _mutex, _already = _single_instance_guard()
+    if _already:
+        # 已有实例：把它的窗口提到前台（刚双击的第二个进程可能还在起窗口，稍等重试几次）
+        if _wait_for_window("VibSpec", tries=6, delay=0.2):
+            sys.exit(0)
+        # 有互斥量却没有窗口：多半是上次残留的进程（后台计算线程把解释器拖住）。
+        # 这种“隐形实例”不拦新窗口，直接启动；它已经不可见，不会出现两个窗口。
+        log_error("single_instance", RuntimeError("mutex exists without window; starting anyway"))
     root = tk.Tk()
     apply_app_theme(root)
     app = VibGUI(root)
